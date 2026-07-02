@@ -1,0 +1,37 @@
+{
+  "instructions": [
+    "Replace this sample target with the legendary goals you want to track.",
+    "Use item_id when you know it, or use an exact item name and the app will look it up.",
+    "Use currency_id for wallet currencies like Karma.",
+    "The sample below is only a starter list, not a full legendary recipe."
+  ],
+  "targets": [
+    {
+      "name": "Example Legendary Goal",
+      "enabled": true,
+      "materials": [
+        {
+          "item_id": 19721,
+          "name": "Glob of Ectoplasm",
+          "amount": 250
+        },
+        {
+          "name": "Mystic Clover",
+          "amount": 77
+        },
+        {
+          "item_id": 19925,
+          "name": "Obsidian Shard",
+          "amount": 250
+        }
+      ],
+      "currencies": [
+        {
+          "currency_id": 2,
+          "name": "Karma",
+          "amount": 500000
+        }
+      ]
+    }
+  ]
+}
