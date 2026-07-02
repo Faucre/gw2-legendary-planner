@@ -29,9 +29,24 @@ API_BASE_URL = "https://api.guildwars2.com/v2"
 # Local file for remembering item name -> item_id lookups.
 DEFAULT_ITEM_CACHE_PATH = Path("item_cache.json")
 
+# Local file for a full item name -> item IDs index.
+DEFAULT_ITEM_NAME_INDEX_PATH = Path("item_name_index.json")
+ITEM_NAME_INDEX_VERSION = 1
+ITEM_INDEX_CHUNK_SIZE = 200
+
 # Local file for remembering Trading Post prices for a short time.
 DEFAULT_PRICE_CACHE_PATH = Path("price_cache.json")
 PRICE_CACHE_TTL_SECONDS = 15 * 60
+GOLD_RECOMMENDATION_THRESHOLD_COPPER = 10 * 10_000
+
+# Local file for remembering character inventory counts between runs.
+DEFAULT_CHARACTER_INVENTORY_CACHE_PATH = Path("character_inventory_cache.json")
+CHARACTER_INVENTORY_CACHE_VERSION = 1
+
+# API calls use one first try plus these retries.
+DEFAULT_API_TIMEOUT_SECONDS = 60
+API_RETRY_DELAYS_SECONDS = (2, 5, 10)
+RETRYABLE_HTTP_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 
 # These are the .env variable names this script will understand.
 API_KEY_VARIABLES = (
@@ -127,7 +142,12 @@ def find_api_key(env_path: Path | None) -> str:
     )
 
 
-def api_get(path: str, api_key: str | None = None, params: dict[str, Any] | None = None) -> Any:
+def api_get(
+    path: str,
+    api_key: str | None = None,
+    params: dict[str, Any] | None = None,
+    timeout_seconds: int = DEFAULT_API_TIMEOUT_SECONDS,
+) -> Any:
     """Call the GW2 API and return decoded JSON."""
 
     url = f"{API_BASE_URL}{path}"
@@ -144,27 +164,55 @@ def api_get(path: str, api_key: str | None = None, params: dict[str, Any] | None
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
-    request = Request(url, headers=headers)
+    total_attempts = len(API_RETRY_DELAYS_SECONDS) + 1
+    total_retries = len(API_RETRY_DELAYS_SECONDS)
+    last_error: Gw2ApiError | None = None
 
-    try:
-        with urlopen(request, timeout=30) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except HTTPError as error:
-        body = error.read().decode("utf-8", errors="replace")
-        message = f"GW2 API returned HTTP {error.code} for {path}."
+    for attempt_number in range(1, total_attempts + 1):
+        request = Request(url, headers=headers)
 
-        if error.code in {401, 403}:
-            message += (
-                " Check that your API key is valid and has wallet, inventories, "
-                "characters, and unlocks permissions."
+        try:
+            with urlopen(request, timeout=timeout_seconds) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except HTTPError as error:
+            body = error.read().decode("utf-8", errors="replace")
+            message = f"GW2 API returned HTTP {error.code} for {path}."
+
+            if error.code in {401, 403}:
+                message += (
+                    " Check that your API key is valid and has wallet, inventories, "
+                    "characters, and unlocks permissions."
+                )
+
+            if body:
+                message += f" API message: {body}"
+
+            last_error = Gw2ApiError(message, status_code=error.code)
+
+            # Some HTTP errors are permanent, so retrying only wastes time.
+            if error.code not in RETRYABLE_HTTP_STATUS_CODES:
+                raise last_error from error
+        except TimeoutError as error:
+            last_error = Gw2ApiError(
+                f"The GW2 API request for {path} timed out after "
+                f"{timeout_seconds} seconds."
             )
+        except URLError as error:
+            last_error = Gw2ApiError(f"Could not reach the GW2 API for {path}: {error.reason}")
 
-        if body:
-            message += f" API message: {body}"
+        if attempt_number < total_attempts:
+            delay_seconds = API_RETRY_DELAYS_SECONDS[attempt_number - 1]
+            print(
+                f"Temporary API problem while requesting {path}. "
+                f"Retrying in {delay_seconds} seconds "
+                f"(retry {attempt_number}/{total_retries})..."
+            )
+            time.sleep(delay_seconds)
 
-        raise Gw2ApiError(message, status_code=error.code) from error
-    except URLError as error:
-        raise Gw2ApiError(f"Could not reach the GW2 API: {error.reason}") from error
+    raise Gw2ApiError(
+        f"The GW2 API did not respond successfully for {path} after "
+        f"{total_retries} retries. Please try again later. Last error: {last_error}"
+    )
 
 
 def fetch_token_permissions(api_key: str) -> set[str]:
@@ -221,6 +269,12 @@ def fetch_character_names(api_key: str) -> list[str]:
     """Fetch the names of every character on the account."""
 
     return api_get("/characters", api_key=api_key)
+
+
+def fetch_character_details(api_key: str) -> list[dict[str, Any]]:
+    """Fetch character details, including age/playtime seconds."""
+
+    return api_get("/characters", api_key=api_key, params={"ids": "all"})
 
 
 def fetch_character_inventory(api_key: str, character_name: str) -> dict[str, Any]:
@@ -295,9 +349,165 @@ def add_character_inventory(
         add_inventory_slots(item_counts, bag.get("inventory", []))
 
 
+def merge_item_counts(
+    item_counts: dict[int, int],
+    extra_counts: dict[int, int],
+) -> None:
+    """Add one item count dictionary into another."""
+
+    for item_id, count in extra_counts.items():
+        add_item_count(item_counts, int(item_id), int(count))
+
+
+def character_inventory_to_counts(character_inventory: dict[str, Any]) -> dict[int, int]:
+    """Convert one character's inventory response into {item_id: count}."""
+
+    item_counts: dict[int, int] = {}
+    add_character_inventory(item_counts, character_inventory)
+    return item_counts
+
+
+def empty_character_inventory_cache() -> dict[str, Any]:
+    """Create the starting shape for character_inventory_cache.json."""
+
+    return {
+        "version": CHARACTER_INVENTORY_CACHE_VERSION,
+        "characters": {},
+    }
+
+
+def load_character_inventory_cache(cache_path: Path) -> dict[str, Any]:
+    """Load cached character inventory counts."""
+
+    if not cache_path.exists():
+        return empty_character_inventory_cache()
+
+    try:
+        cache = json.loads(cache_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            f"Could not read {cache_path}. Delete the file and run again, "
+            "or fix it so it is valid JSON."
+        ) from error
+
+    if not isinstance(cache, dict):
+        return empty_character_inventory_cache()
+
+    if cache.get("version") != CHARACTER_INVENTORY_CACHE_VERSION:
+        return empty_character_inventory_cache()
+
+    if not isinstance(cache.get("characters"), dict):
+        cache["characters"] = {}
+
+    return cache
+
+
+def save_character_inventory_cache(cache_path: Path, cache: dict[str, Any]) -> None:
+    """Save cached character inventory counts."""
+
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(
+            json.dumps(cache, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    except OSError as error:
+        raise ValueError(f"Could not save character inventory cache at {cache_path}.") from error
+
+
+def cache_entry_to_item_counts(cache_entry: dict[str, Any]) -> dict[int, int]:
+    """Convert cached JSON item counts back to integer item IDs."""
+
+    raw_counts = cache_entry.get("inventory_item_counts", {})
+
+    if not isinstance(raw_counts, dict):
+        return {}
+
+    return {int(item_id): int(count) for item_id, count in raw_counts.items()}
+
+
+def make_character_cache_entry(
+    character_name: str,
+    character_age: int,
+    inventory_item_counts: dict[int, int],
+) -> dict[str, Any]:
+    """Create one character cache entry."""
+
+    return {
+        "name": character_name,
+        "age": int(character_age),
+        "inventory_item_counts": {
+            str(item_id): int(count)
+            for item_id, count in sorted(inventory_item_counts.items())
+        },
+        "scan_timestamp": int(time.time()),
+    }
+
+
+def build_character_inventory_counts(
+    api_key: str,
+    cache_path: Path,
+    force_refresh: bool = False,
+) -> tuple[dict[int, int], dict[str, int]]:
+    """Use cached character inventories unless a character's age changed."""
+
+    character_counts: dict[int, int] = {}
+    cache = load_character_inventory_cache(cache_path)
+    new_cache = empty_character_inventory_cache()
+    details = fetch_character_details(api_key)
+    current_names = set()
+    cached_count = 0
+    refreshed_count = 0
+
+    for character in details:
+        character_name = str(character.get("name", "")).strip()
+
+        if not character_name:
+            continue
+
+        current_names.add(character_name)
+        character_age = int(character.get("age", 0))
+        cached_entry = cache["characters"].get(character_name)
+        can_use_cache = (
+            not force_refresh
+            and cached_entry is not None
+            and int(cached_entry.get("age", -1)) == character_age
+            and isinstance(cached_entry.get("inventory_item_counts"), dict)
+        )
+
+        if can_use_cache:
+            inventory_counts = cache_entry_to_item_counts(cached_entry)
+            cached_count += 1
+        else:
+            print(f"Refreshing character inventory: {character_name}")
+            character_inventory = fetch_character_inventory(api_key, character_name)
+            inventory_counts = character_inventory_to_counts(character_inventory)
+            refreshed_count += 1
+
+        merge_item_counts(character_counts, inventory_counts)
+        new_cache["characters"][character_name] = make_character_cache_entry(
+            character_name,
+            character_age,
+            inventory_counts,
+        )
+        save_character_inventory_cache(cache_path, new_cache)
+
+    removed_count = len(set(cache.get("characters", {})) - current_names)
+    save_character_inventory_cache(cache_path, new_cache)
+
+    return character_counts, {
+        "total": len(current_names),
+        "cached": cached_count,
+        "refreshed": refreshed_count,
+        "removed": removed_count,
+    }
+
+
 def build_combined_item_counts(
     api_key: str,
     token_permissions: set[str],
+    character_cache_path: Path,
+    refresh_character_inventories: bool = False,
 ) -> tuple[dict[int, int], dict[str, list[str]]]:
     """Build one {item_id: count} dictionary from all item storage locations."""
 
@@ -346,16 +556,28 @@ def build_combined_item_counts(
         return item_counts, scan_summary
 
     # Character inventories are the bags carried by each individual character.
-    print("Finding characters...")
-    character_names = fetch_character_names(api_key)
+    print("Checking character inventory cache...")
+    character_counts, character_summary = build_character_inventory_counts(
+        api_key,
+        character_cache_path,
+        force_refresh=refresh_character_inventories,
+    )
+    merge_item_counts(item_counts, character_counts)
 
-    for character_name in character_names:
-        print(f"Scanning character inventory: {character_name}")
-        character_inventory = fetch_character_inventory(api_key, character_name)
-        add_character_inventory(item_counts, character_inventory)
+    cache_message = (
+        f"Using cached inventories for {character_summary['cached']:,} characters; "
+        f"refreshed {character_summary['refreshed']:,} characters."
+    )
+    print(cache_message)
+
+    if character_summary["removed"]:
+        print(
+            f"Removed {character_summary['removed']:,} old character cache entries "
+            "for deleted or renamed characters."
+        )
 
     scan_summary["scanned_sources"].append(
-        f"character inventories ({len(character_names):,} characters)"
+        f"character inventories ({cache_message})"
     )
 
     return item_counts, scan_summary
@@ -482,28 +704,177 @@ def fetch_all_item_ids() -> list[int]:
     return api_get("/items")
 
 
-def lookup_uncached_item_names(item_names: set[str]) -> dict[str, dict[str, Any]]:
-    """Look up uncached material names using the public /v2/items endpoint."""
+def empty_item_name_index() -> dict[str, Any]:
+    """Create the starting shape for item_name_index.json."""
 
-    names_by_normalized = {normalize_item_name(name): name for name in item_names}
-    matches_by_name = {normalized_name: [] for normalized_name in names_by_normalized}
+    return {
+        "version": ITEM_NAME_INDEX_VERSION,
+        "complete": False,
+        "item_ids": [],
+        "next_index": 0,
+        "items_by_name": {},
+    }
 
-    print("Looking up item names from the official GW2 API...")
-    item_ids = fetch_all_item_ids()
 
-    for id_chunk in chunked(item_ids, 200):
-        rows = api_get("/items", params={"ids": ",".join(str(item_id) for item_id in id_chunk)})
+def load_item_name_index(index_path: Path) -> dict[str, Any]:
+    """Load the reusable item name index."""
+
+    if not index_path.exists():
+        return empty_item_name_index()
+
+    try:
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            f"Could not read {index_path}. Delete the file and run again, "
+            "or fix it so it is valid JSON."
+        ) from error
+
+    if not isinstance(index, dict):
+        return empty_item_name_index()
+
+    if index.get("version") != ITEM_NAME_INDEX_VERSION:
+        return empty_item_name_index()
+
+    if not isinstance(index.get("items_by_name"), dict):
+        index["items_by_name"] = {}
+
+    if not isinstance(index.get("item_ids"), list):
+        index["item_ids"] = []
+
+    index["next_index"] = int(index.get("next_index", 0))
+    index["complete"] = bool(index.get("complete", False))
+    return index
+
+
+def save_item_name_index(index_path: Path, index: dict[str, Any]) -> None:
+    """Save item_name_index.json so interrupted builds can resume."""
+
+    try:
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        index_path.write_text(
+            json.dumps(index, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    except OSError as error:
+        raise ValueError(f"Could not save item name index at {index_path}.") from error
+
+
+def add_item_to_name_index(index: dict[str, Any], item: dict[str, Any]) -> None:
+    """Add one item row to the name index, keeping duplicates visible."""
+
+    item_id = item.get("id")
+    item_name = item.get("name")
+
+    if item_id is None or not item_name:
+        return
+
+    normalized_name = normalize_item_name(str(item_name))
+    entry = {
+        "id": int(item_id),
+        "item_id": int(item_id),
+        "name": str(item_name),
+    }
+    matches = index["items_by_name"].setdefault(normalized_name, [])
+
+    if not any(existing.get("item_id") == entry["item_id"] for existing in matches):
+        matches.append(entry)
+
+
+def ensure_item_name_index(
+    index_path: Path,
+    rebuild: bool = False,
+) -> dict[str, Any]:
+    """Build or load item_name_index.json for fast future name lookups."""
+
+    if rebuild:
+        print(f"Rebuilding {index_path} from the official GW2 item list...")
+        index = empty_item_name_index()
+        save_item_name_index(index_path, index)
+    else:
+        index = load_item_name_index(index_path)
+
+    if index["complete"]:
+        print(f"Using {index_path} for fast item name lookup.")
+        return index
+
+    if not index["item_ids"]:
+        print("Building item name index from the official GW2 API.")
+        print("The first run may take a while, but future name lookups will be much faster.")
+
+        try:
+            index["item_ids"] = fetch_all_item_ids()
+        except Gw2ApiError as error:
+            raise ItemLookupError(
+                "Could not get the GW2 item list while building the item name index. "
+                "Please try again in a few minutes. "
+                f"API error: {error}"
+            ) from error
+
+        index["next_index"] = 0
+        save_item_name_index(index_path, index)
+    else:
+        print(f"Resuming item name index build from {index_path}.")
+
+    item_ids = [int(item_id) for item_id in index["item_ids"]]
+    total_items = len(item_ids)
+
+    while index["next_index"] < total_items:
+        start_index = int(index["next_index"])
+        end_index = min(start_index + ITEM_INDEX_CHUNK_SIZE, total_items)
+        id_chunk = item_ids[start_index:end_index]
+
+        try:
+            rows = api_get(
+                "/items",
+                params={"ids": ",".join(str(item_id) for item_id in id_chunk)},
+            )
+        except Gw2ApiError as error:
+            save_item_name_index(index_path, index)
+            raise ItemLookupError(
+                f"Item name index build paused at {start_index:,}/{total_items:,} item IDs. "
+                f"Progress was saved to {index_path}. Run the app again to continue. "
+                f"API error: {error}"
+            ) from error
 
         for item in rows:
-            normalized_name = normalize_item_name(item.get("name", ""))
+            add_item_to_name_index(index, item)
 
-            if normalized_name in matches_by_name:
-                matches_by_name[normalized_name].append(item)
+        index["next_index"] = end_index
+        save_item_name_index(index_path, index)
+
+        chunk_number = (end_index + ITEM_INDEX_CHUNK_SIZE - 1) // ITEM_INDEX_CHUNK_SIZE
+        total_chunks = (total_items + ITEM_INDEX_CHUNK_SIZE - 1) // ITEM_INDEX_CHUNK_SIZE
+
+        if chunk_number == 1 or chunk_number == total_chunks or chunk_number % 10 == 0:
+            print(f"Item name index progress: {end_index:,}/{total_items:,} item IDs.")
+
+    index["complete"] = True
+    save_item_name_index(index_path, index)
+    print(f"Item name index ready: {index_path}")
+    return index
+
+
+def lookup_uncached_item_names(
+    item_names: set[str],
+    cache: dict[str, Any],
+    cache_path: Path,
+    index_path: Path,
+    rebuild_index: bool = False,
+) -> dict[str, dict[str, Any]]:
+    """Look up uncached material names using item_name_index.json."""
 
     resolved_items: dict[str, dict[str, Any]] = {}
+    total_names = len(item_names)
+    index = ensure_item_name_index(index_path, rebuild=rebuild_index)
 
-    for normalized_name, typed_name in names_by_normalized.items():
-        matches = matches_by_name[normalized_name]
+    print(f"Need to look up {total_names} item name(s).")
+
+    for name_number, typed_name in enumerate(sorted(item_names, key=normalize_item_name), start=1):
+        normalized_target_name = normalize_item_name(typed_name)
+        matches = index["items_by_name"].get(normalized_target_name, [])
+
+        print(f"Item lookup {name_number}/{total_names}: {typed_name}")
 
         if not matches:
             raise ItemLookupError(
@@ -522,6 +893,9 @@ def lookup_uncached_item_names(item_names: set[str]) -> dict[str, dict[str, Any]
             )
 
         resolved_items[typed_name] = matches[0]
+        cache_item_lookup(cache, typed_name, matches[0])
+        save_item_cache(cache_path, cache)
+        print(f"  Saved {typed_name} as item_id {matches[0]['id']} in {cache_path}.")
 
     return resolved_items
 
@@ -702,6 +1076,8 @@ def material_has_item_id(material: dict[str, Any]) -> bool:
 def resolve_goal_material_names(
     targets: list[dict[str, Any]],
     cache_path: Path,
+    index_path: Path,
+    rebuild_item_index: bool = False,
 ) -> list[dict[str, Any]]:
     """Fill in item_id for materials that were written with name only."""
 
@@ -726,12 +1102,15 @@ def resolve_goal_material_names(
                 names_to_lookup.add(material_name)
 
     if names_to_lookup:
-        found_items = lookup_uncached_item_names(names_to_lookup)
-
-        for typed_name, item in found_items.items():
-            cache_item_lookup(cache, typed_name, item)
-
-        save_item_cache(cache_path, cache)
+        lookup_uncached_item_names(
+            names_to_lookup,
+            cache,
+            cache_path,
+            index_path,
+            rebuild_index=rebuild_item_index,
+        )
+    elif rebuild_item_index:
+        ensure_item_name_index(index_path, rebuild=True)
 
     resolved_targets: list[dict[str, Any]] = []
 
@@ -931,6 +1310,157 @@ def price_text_for_missing_entry(
     return f"est. {format_coin(total_price)}"
 
 
+def is_named_item(missing_entry: dict[str, Any], item_name: str) -> bool:
+    """Check a missing item by name, ignoring case and extra spaces."""
+
+    return normalize_item_name(missing_entry["name"]) == normalize_item_name(item_name)
+
+
+def is_provisioners_token(missing_entry: dict[str, Any]) -> bool:
+    """Check whether a missing item looks like a Provisioner's Token."""
+
+    normalized_name = normalize_item_name(missing_entry["name"])
+    return "provisioner" in normalized_name and "token" in normalized_name
+
+
+def is_obsidian_armor_essence(
+    target_name: str,
+    missing_entry: dict[str, Any],
+) -> bool:
+    """Check whether a missing item looks like an Obsidian armor essence."""
+
+    normalized_target = normalize_item_name(target_name)
+    normalized_name = normalize_item_name(missing_entry["name"])
+
+    if "essence" not in normalized_name:
+        return False
+
+    essence_words = ("despair", "greed", "triumph", "kryptis")
+    return "obsidian armor" in normalized_target or any(
+        word in normalized_name for word in essence_words
+    )
+
+
+def priced_missing_total(
+    missing_items: list[dict[str, Any]],
+    price_estimates: dict[int, dict[str, Any]] | None,
+) -> int:
+    """Add up the Trading Post estimate for priced missing items."""
+
+    if price_estimates is None:
+        return 0
+
+    total_copper = 0
+
+    for item in missing_items:
+        price = price_estimates.get(item["id"])
+
+        if not price or price.get("sell_unit_price") is None:
+            continue
+
+        total_copper += int(price["sell_unit_price"]) * int(item["missing"])
+
+    return total_copper
+
+
+def is_gold_currency(missing_currency: dict[str, Any]) -> bool:
+    """Check whether a missing wallet currency is account coin/gold."""
+
+    normalized_name = normalize_item_name(missing_currency["name"])
+    return missing_currency["id"] == 1 or "coin" in normalized_name or "gold" in normalized_name
+
+
+def build_rule_recommendations(
+    target_name: str,
+    missing_items: list[dict[str, Any]],
+    missing_currencies: list[dict[str, Any]],
+    price_estimates: dict[int, dict[str, Any]] | None,
+) -> list[str]:
+    """Build simple rule-based recommendations from missing items and currencies."""
+
+    recommendations: list[str] = []
+
+    if any(is_named_item(item, "Mystic Clover") for item in missing_items):
+        recommendations.append(
+            "Mystic Clover: do Wizard's Vault objectives, work WvW reward tracks, "
+            "and check weekly vendor sources."
+        )
+
+    if any(is_named_item(item, "Gift of Battle") for item in missing_items):
+        recommendations.append("Gift of Battle: put today's play time into WvW reward track progress.")
+
+    if any(is_provisioners_token(item) for item in missing_items):
+        recommendations.append(
+            "Provisioner's Token: buy the easy daily Provisioner's Token options first."
+        )
+
+    if any(is_obsidian_armor_essence(target_name, item) for item in missing_items):
+        recommendations.append(
+            "Obsidian armor essences: run Convergences and do rift hunting for essence progress."
+        )
+
+    gold_currency_missing = any(is_gold_currency(currency) for currency in missing_currencies)
+    priced_total = priced_missing_total(missing_items, price_estimates)
+
+    if gold_currency_missing or priced_total >= GOLD_RECOMMENDATION_THRESHOLD_COPPER:
+        recommendations.append(
+            "Gold pressure: choose low-burnout profit sources like daily Wizard's Vault "
+            "objectives, quick strikes/fractals/metas you enjoy, gathering, and selling "
+            "surplus materials before buying missing items."
+        )
+
+    if missing_currencies and not gold_currency_missing:
+        currency_names = ", ".join(currency["name"] for currency in missing_currencies[:3])
+        recommendations.append(
+            f"Currency gap: prioritize activities that award {currency_names} before spending gold."
+        )
+
+    return recommendations
+
+
+def build_target_status(
+    target: dict[str, Any],
+    wallet: dict[int, int],
+    item_counts: dict[int, int],
+    legendary_armory: dict[int, int],
+    item_names: dict[int, str],
+    currency_names: dict[int, str],
+) -> dict[str, Any]:
+    """Collect missing item/currency details for one target."""
+
+    target_name = target.get("name", "Unnamed target")
+    material_entries = normalize_goal_entries(
+        target_name,
+        target.get("materials", []),
+        ("item_id", "id"),
+        "materials",
+    )
+    currency_entries = normalize_goal_entries(
+        target_name,
+        target.get("currencies", []),
+        ("currency_id", "id"),
+        "currencies",
+    )
+
+    return {
+        "target": target,
+        "name": target_name,
+        "is_unlocked": is_target_unlocked(target, legendary_armory),
+        "missing_items": get_missing_entries(
+            material_entries,
+            item_counts,
+            item_names,
+            "Item",
+        ),
+        "missing_currencies": get_missing_entries(
+            currency_entries,
+            wallet,
+            currency_names,
+            "Currency",
+        ),
+    }
+
+
 def make_missing_lines(
     entries: list[dict[str, Any]],
     owned_counts: dict[int, int],
@@ -1072,6 +1602,92 @@ def add_already_unlocked_section(
     lines.append("")
 
 
+def add_recommended_today_section(
+    lines: list[str],
+    targets: list[dict[str, Any]],
+    wallet: dict[int, int],
+    item_counts: dict[int, int],
+    legendary_armory: dict[int, int],
+    item_names: dict[int, str],
+    currency_names: dict[int, str],
+    price_estimates: dict[int, dict[str, Any]] | None,
+) -> None:
+    """Add focused recommendations for the first incomplete target, plus future notes."""
+
+    target_statuses = [
+        build_target_status(
+            target,
+            wallet,
+            item_counts,
+            legendary_armory,
+            item_names,
+            currency_names,
+        )
+        for target in targets
+    ]
+    incomplete_indexes = [
+        index
+        for index, status in enumerate(target_statuses)
+        if not status["is_unlocked"]
+        and (status["missing_items"] or status["missing_currencies"])
+    ]
+
+    lines.append("Recommended today")
+
+    if not incomplete_indexes:
+        lines.append("  No missing items or currencies found for incomplete targets.")
+        lines.append("")
+        return
+
+    main_index = incomplete_indexes[0]
+    main_status = target_statuses[main_index]
+    main_recommendations = build_rule_recommendations(
+        main_status["name"],
+        main_status["missing_items"],
+        main_status["missing_currencies"],
+        price_estimates,
+    )
+
+    lines.append(f"  Main target: {main_status['name']}")
+
+    if main_recommendations:
+        for recommendation in main_recommendations:
+            lines.append(f"    - {recommendation}")
+    else:
+        biggest_missing = sorted(
+            main_status["missing_items"] + main_status["missing_currencies"],
+            key=lambda entry: entry["missing"],
+            reverse=True,
+        )[0]
+        lines.append(
+            f"    - No special daily rule matched. Work on {biggest_missing['name']} first."
+        )
+
+    future_lines = []
+
+    for future_index in incomplete_indexes[1:]:
+        future_status = target_statuses[future_index]
+        future_recommendations = build_rule_recommendations(
+            future_status["name"],
+            future_status["missing_items"],
+            future_status["missing_currencies"],
+            price_estimates,
+        )
+
+        if future_recommendations:
+            future_lines.append(
+                f"    - {future_status['name']}: {'; '.join(future_recommendations[:2])}"
+            )
+
+    if future_lines:
+        lines.append("  Secondary recommendations for future targets:")
+        lines.extend(future_lines)
+    else:
+        lines.append("  Secondary recommendations for future targets: none from today's rules.")
+
+    lines.append("")
+
+
 def build_report(
     targets: list[dict[str, Any]],
     wallet: dict[int, int],
@@ -1114,6 +1730,17 @@ def build_report(
             ]
         )
         return "\n".join(lines)
+
+    add_recommended_today_section(
+        lines,
+        targets,
+        wallet,
+        item_counts,
+        legendary_armory,
+        item_names,
+        currency_names,
+        price_estimates,
+    )
 
     for target in targets:
         target_name = target.get("name", "Unnamed target")
@@ -1204,6 +1831,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip Trading Post price estimates.",
     )
+    parser.add_argument(
+        "--rebuild-item-index",
+        action="store_true",
+        help="Force rebuilding item_name_index.json before resolving item names.",
+    )
+    parser.add_argument(
+        "--refresh-character-inventories",
+        action="store_true",
+        help="Force a fresh scan of every character inventory.",
+    )
     return parser.parse_args()
 
 
@@ -1220,7 +1857,12 @@ def main() -> int:
         warn_about_missing_permissions(token_permissions)
 
         targets = load_goals(Path(args.config))
-        targets = resolve_goal_material_names(targets, DEFAULT_ITEM_CACHE_PATH)
+        targets = resolve_goal_material_names(
+            targets,
+            DEFAULT_ITEM_CACHE_PATH,
+            DEFAULT_ITEM_NAME_INDEX_PATH,
+            rebuild_item_index=args.rebuild_item_index,
+        )
 
         legendary_armory: dict[int, int] = {}
         armory_summary: dict[str, Any] = {
@@ -1246,7 +1888,12 @@ def main() -> int:
         else:
             print("Skipping wallet currencies because the API key is missing wallet permission.")
 
-        item_counts, scan_summary = build_combined_item_counts(api_key, token_permissions)
+        item_counts, scan_summary = build_combined_item_counts(
+            api_key,
+            token_permissions,
+            DEFAULT_CHARACTER_INVENTORY_CACHE_PATH,
+            refresh_character_inventories=args.refresh_character_inventories,
+        )
 
         item_ids, currency_ids = collect_goal_ids(targets)
         price_estimates = None

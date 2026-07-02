@@ -5,5 +5,7 @@ __pycache__/
 *.py[cod]
 reports/
 item_cache.json
+item_name_index.json
 price_cache.json
+character_inventory_cache.json
 API_Key.env
