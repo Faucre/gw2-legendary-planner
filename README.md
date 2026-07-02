@@ -35,10 +35,24 @@ The first name lookup may take a while because the app builds `item_name_index.j
 python gw2_legendary_planner.py
 ```
 
+By default, the report uses a clean summary format: scan summary, `Recommended today`, and each enabled target in priority order.
+
 To also show completed entries:
 
 ```bash
 python gw2_legendary_planner.py --show-complete
+```
+
+To show more target detail, including useful empty sections:
+
+```bash
+python gw2_legendary_planner.py --detailed
+```
+
+To show API, scan, and cache details for troubleshooting:
+
+```bash
+python gw2_legendary_planner.py --debug
 ```
 
 To skip Trading Post price estimates:
@@ -65,7 +79,7 @@ To save a report:
 python gw2_legendary_planner.py --output reports/missing-materials.txt
 ```
 
-The report includes a `Recommended today` section. It looks at the first incomplete enabled target first, then gives shorter secondary notes for later targets.
+The report includes a `Recommended today` section. It looks at the first incomplete enabled target first, separates gameplay recommendations from configuration/TODO recommendations, then gives shorter secondary notes for later targets.
 
 ## Config Format
 
@@ -74,6 +88,31 @@ Each target can have `materials`, `currencies`, manual `steps`, and an optional 
 Use `final_item_id` for the finished legendary item. If that item is already in your Legendary Armory, the app marks the target as complete.
 
 Use `steps` for manual checklist items that are not API materials or wallet currencies.
+
+You can also reference a recipe template from the `templates/` folder. Template names are written without `.json`:
+
+```json
+{
+  "targets": [
+    {
+      "template": "klobjarne_geirr",
+      "enabled": true
+    },
+    {
+      "template": "aurene_longbow",
+      "enabled": true,
+      "steps": [
+        {
+          "name": "Personal reminder: check alt account materials",
+          "complete": false
+        }
+      ]
+    }
+  ]
+}
+```
+
+Targets without `template` still work as fully manual targets:
 
 ```json
 {
@@ -130,6 +169,11 @@ Use `steps` for manual checklist items that are not API materials or wallet curr
 - Before scanning, the script checks `/v2/tokeninfo` and warns if the key is missing needed permissions.
 - Legendary Armory unlocks come from `/v2/account/legendaryarmory`.
 - Targets with `final_item_id` are marked complete when that item is already unlocked.
+- Target status labels are `Complete`, `In progress`, `Needs recipe data`, or `Needs manual checklist work`.
+- Targets with TODO recipe/checklist steps but no material or currency data are marked `Needs recipe data`.
+- Normal output hides empty material/currency sections; use `--detailed` when you want to audit every section.
+- Recipe templates live in `templates/`. If a template has TODO notes, verify the recipe before relying on exact quantities.
+- Template targets can add extra `steps`, `materials`, or `currencies` in `legendary_goals.json`.
 - Manual `steps` are shown in the report but are not counted as item IDs or wallet currencies.
 - Completed manual steps are shown only when you run with `--show-complete`.
 - Optional `source_hint` text is shown under missing materials or currencies.
@@ -142,6 +186,7 @@ Use `steps` for manual checklist items that are not API materials or wallet curr
 - Trading Post estimates use the lowest sell price as the buy-now price.
 - Price lookups are cached in `price_cache.json` for 15 minutes.
 - Account-bound or otherwise unpriced missing items are shown as `not priced`.
+- Coin values are shown as gold/silver/copper, such as `123g 45s 67c`.
 - Daily recommendations are simple rules for now, based on missing items, currencies, and estimated gold pressure.
 - Wallet currencies stay separate from item counts because the API returns them as currencies instead of item stacks.
 - The script does not count trading post listings or mail yet.

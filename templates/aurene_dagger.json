@@ -1,0 +1,25 @@
+{
+  "name": "Aurene Dagger",
+  "final_item_id": null,
+  "recipe_status": "needs_verification",
+  "steps": [
+    {
+      "name": "TODO: Verify final_item_id for the Aurene dagger",
+      "complete": false,
+      "notes": "Add the exact final item ID after confirming the in-game/API item."
+    },
+    {
+      "name": "TODO: Verify full Generation 3 dagger recipe",
+      "complete": false,
+      "notes": "Confirm exact gifts, Mystic Clover count, Antique Summoning Stone needs, and EoD account-bound requirements."
+    }
+  ],
+  "materials": [
+    {
+      "name": "Gift of Battle",
+      "amount": 1,
+      "source_hint": "Complete WvW reward track progress. TODO: verify against the exact Aurene dagger recipe."
+    }
+  ],
+  "currencies": []
+}

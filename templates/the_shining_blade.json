@@ -1,0 +1,30 @@
+{
+  "name": "The Shining Blade",
+  "final_item_id": null,
+  "recipe_status": "needs_verification",
+  "steps": [
+    {
+      "name": "TODO: Verify final_item_id for The Shining Blade",
+      "complete": false,
+      "notes": "Add the exact final item ID after confirming the API item."
+    },
+    {
+      "name": "Complete or verify The Shining Blade collection progress",
+      "complete": false,
+      "notes": "This legendary has account-bound collection/gift work; verify exact current requirements before adding quantities."
+    },
+    {
+      "name": "TODO: Verify full The Shining Blade recipe quantities",
+      "complete": false,
+      "notes": "Do not guess Mystic Clover, gift, map currency, or crafting component totals."
+    }
+  ],
+  "materials": [
+    {
+      "name": "Gift of Battle",
+      "amount": 1,
+      "source_hint": "Complete WvW reward track progress."
+    }
+  ],
+  "currencies": []
+}

@@ -1,0 +1,24 @@
+{
+  "name": "Obsidian Armor set",
+  "final_item_id": null,
+  "recipe_status": "needs_verification",
+  "steps": [
+    {
+      "name": "TODO: Verify Obsidian Armor set final_item_id handling",
+      "complete": false,
+      "notes": "Armor is multiple pieces, so armory completion may need several final item IDs instead of one."
+    },
+    {
+      "name": "Track account-bound Obsidian armor essence progress",
+      "complete": false,
+      "notes": "Verify exact Essence of Despair, Essence of Greed, Essence of Triumph, map currency, and achievement requirements before adding quantities."
+    },
+    {
+      "name": "Run Convergences and rift hunting for armor progress",
+      "complete": false,
+      "notes": "Use this as a reminder until exact material quantities are filled in."
+    }
+  ],
+  "materials": [],
+  "currencies": []
+}

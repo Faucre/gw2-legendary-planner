@@ -1,0 +1,25 @@
+{
+  "name": "Klobjarne Geirr",
+  "final_item_id": null,
+  "recipe_status": "needs_verification",
+  "steps": [
+    {
+      "name": "TODO: Verify final_item_id and full Klobjarne Geirr recipe",
+      "complete": false,
+      "notes": "Exact recipe data was not added because it should be verified before tracking quantities."
+    },
+    {
+      "name": "Review account-bound and time-gated spear requirements",
+      "complete": false,
+      "notes": "Check current wiki/API recipe data for gifts, achievements, collections, and time-gated materials."
+    }
+  ],
+  "materials": [
+    {
+      "name": "Gift of Battle",
+      "amount": 1,
+      "source_hint": "Complete WvW reward track progress. TODO: verify this applies to Klobjarne Geirr's exact recipe."
+    }
+  ],
+  "currencies": []
+}

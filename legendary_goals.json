@@ -1,52 +1,46 @@
 {
   "instructions": [
-    "Replace this sample target with the legendary goals you want to track.",
-    "Use item_id when you know it, or use an exact item name and the app will look it up.",
-    "Use currency_id for wallet currencies like Karma.",
-    "Use source_hint on materials or currencies when you want a reminder of where to get them.",
-    "The sample below is only a starter list, not a full legendary recipe."
+    "Targets can reference reusable templates from the templates folder.",
+    "Use template names without .json, such as klobjarne_geirr.",
+    "You can still add extra steps, materials, or currencies directly on a target.",
+    "Template recipe data with TODO notes needs verification before you rely on exact quantities."
   ],
   "targets": [
     {
-      "name": "Klobjarne Geirr",
-      "enabled": true,
-      "final_item_id": null,
-      "steps": [
-        {
-          "name": "Finish time-gated daily materials",
-          "complete": false,
-          "notes": "Update manually when the cooldowns are done."
-        },
-        {
-          "name": "Craft final gift",
-          "complete": false
-        }
-      ],
-      "materials": [
-        {
-          "item_id": 19721,
-          "name": "Glob of Ectoplasm",
-          "amount": 250
-        },
-        {
-          "name": "Mystic Clover",
-          "amount": 77
-        },
-        {
-          "item_id": 19925,
-          "name": "Obsidian Shard",
-          "amount": 250,
-          "source_hint": "Buy with Karma from vendors, or obtain from map currencies/reward tracks."
-        }
-      ],
-      "currencies": [
-        {
-          "currency_id": 2,
-          "name": "Karma",
-          "amount": 500000,
-          "source_hint": "Earn from events, daily Wizard's Vault objectives, and account boosts."
-        }
-      ]
+      "template": "klobjarne_geirr",
+      "enabled": true
+    },
+    {
+      "template": "aurene_longbow",
+      "enabled": true
+    },
+    {
+      "template": "astralaria",
+      "enabled": true
+    },
+    {
+      "template": "aurene_dagger",
+      "enabled": true
+    },
+    {
+      "template": "the_shining_blade",
+      "enabled": true
+    },
+    {
+      "template": "aurene_pistol",
+      "enabled": true
+    },
+    {
+      "template": "legendary_rune_set",
+      "enabled": true
+    },
+    {
+      "template": "legendary_sigil_set",
+      "enabled": true
+    },
+    {
+      "template": "obsidian_armor_set",
+      "enabled": true
     }
   ]
 }

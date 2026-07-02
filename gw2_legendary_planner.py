@@ -26,6 +26,9 @@ from urllib.request import Request, urlopen
 # Official Guild Wars 2 API base URL.
 API_BASE_URL = "https://api.guildwars2.com/v2"
 
+# Folder for reusable legendary recipe templates.
+DEFAULT_TEMPLATES_DIR = Path("templates")
+
 # Local file for remembering item name -> item_id lookups.
 DEFAULT_ITEM_CACHE_PATH = Path("item_cache.json")
 
@@ -62,6 +65,25 @@ API_KEY_VARIABLES = (
 # - characters: lists characters so we can scan each character's bags.
 # - unlocks: reads unlocked account items, including the Legendary Armory.
 REQUIRED_PERMISSIONS = ("wallet", "inventories", "characters", "unlocks")
+
+# Report modes:
+# - summary is the normal clean output.
+# - detailed keeps helpful empty sections and completed entries when requested.
+# - debug also prints scan/API/cache progress while the app is running.
+OUTPUT_MODE_SUMMARY = "summary"
+OUTPUT_MODE_DETAILED = "detailed"
+OUTPUT_MODE_DEBUG = "debug"
+
+# This is set from --debug in main(). It keeps normal runs quiet while still
+# making troubleshooting information easy to turn on.
+DEBUG_OUTPUT = False
+
+
+def debug_print(message: str) -> None:
+    """Print troubleshooting details only when --debug is used."""
+
+    if DEBUG_OUTPUT:
+        print(message)
 
 
 class Gw2ApiError(Exception):
@@ -170,6 +192,7 @@ def api_get(
 
     for attempt_number in range(1, total_attempts + 1):
         request = Request(url, headers=headers)
+        debug_print(f"API GET {path} (attempt {attempt_number}/{total_attempts})")
 
         try:
             with urlopen(request, timeout=timeout_seconds) as response:
@@ -479,7 +502,7 @@ def build_character_inventory_counts(
             inventory_counts = cache_entry_to_item_counts(cached_entry)
             cached_count += 1
         else:
-            print(f"Refreshing character inventory: {character_name}")
+            debug_print(f"Refreshing character inventory: {character_name}")
             character_inventory = fetch_character_inventory(api_key, character_name)
             inventory_counts = character_inventory_to_counts(character_inventory)
             refreshed_count += 1
@@ -527,7 +550,7 @@ def build_combined_item_counts(
         return item_counts, scan_summary
 
     # Material storage is the account-wide crafting material vault.
-    print("Scanning material storage...")
+    debug_print("Scanning material storage...")
     material_storage = fetch_material_storage(api_key)
     for item_id, count in material_storage.items():
         add_item_count(item_counts, item_id, count)
@@ -536,13 +559,13 @@ def build_combined_item_counts(
     )
 
     # The bank is account-wide storage. Empty bank slots are returned as null.
-    print("Scanning bank...")
+    debug_print("Scanning bank...")
     bank_slots = fetch_bank(api_key)
     add_inventory_slots(item_counts, bank_slots)
     scan_summary["scanned_sources"].append(f"bank ({len(bank_slots):,} slots)")
 
     # Shared inventory slots are account-wide slots visible to all characters.
-    print("Scanning shared inventory slots...")
+    debug_print("Scanning shared inventory slots...")
     shared_inventory_slots = fetch_shared_inventory(api_key)
     add_inventory_slots(item_counts, shared_inventory_slots)
     scan_summary["scanned_sources"].append(
@@ -556,7 +579,7 @@ def build_combined_item_counts(
         return item_counts, scan_summary
 
     # Character inventories are the bags carried by each individual character.
-    print("Checking character inventory cache...")
+    debug_print("Checking character inventory cache...")
     character_counts, character_summary = build_character_inventory_counts(
         api_key,
         character_cache_path,
@@ -568,10 +591,10 @@ def build_combined_item_counts(
         f"Using cached inventories for {character_summary['cached']:,} characters; "
         f"refreshed {character_summary['refreshed']:,} characters."
     )
-    print(cache_message)
+    debug_print(cache_message)
 
     if character_summary["removed"]:
-        print(
+        debug_print(
             f"Removed {character_summary['removed']:,} old character cache entries "
             "for deleted or renamed characters."
         )
@@ -621,6 +644,15 @@ def format_coin(copper: int) -> str:
         parts.append(f"{copper_left}c")
 
     return " ".join(parts)
+
+
+def format_goal_amount(entry_id: int, amount: int, fallback_label: str) -> str:
+    """Format item counts normally and account coin as gold/silver/copper."""
+
+    if fallback_label == "Currency" and entry_id == 1:
+        return format_coin(amount)
+
+    return f"{amount:,}"
 
 
 def normalize_item_name(item_name: str) -> str:
@@ -795,7 +827,7 @@ def ensure_item_name_index(
         index = load_item_name_index(index_path)
 
     if index["complete"]:
-        print(f"Using {index_path} for fast item name lookup.")
+        debug_print(f"Using {index_path} for fast item name lookup.")
         return index
 
     if not index["item_ids"]:
@@ -895,7 +927,7 @@ def lookup_uncached_item_names(
         resolved_items[typed_name] = matches[0]
         cache_item_lookup(cache, typed_name, matches[0])
         save_item_cache(cache_path, cache)
-        print(f"  Saved {typed_name} as item_id {matches[0]['id']} in {cache_path}.")
+        debug_print(f"Saved {typed_name} as item_id {matches[0]['id']} in {cache_path}.")
 
     return resolved_items
 
@@ -1027,17 +1059,24 @@ def get_price_estimates(
     cache = load_price_cache(cache_path)
     now = time.time()
     ids_to_fetch: list[int] = []
+    cached_price_count = 0
 
     for item_id in sorted(item_ids):
         cached_price = get_cached_price(cache, item_id, now)
 
         if cached_price:
+            cached_price_count += 1
             price_estimates[item_id] = cached_price
         else:
             ids_to_fetch.append(item_id)
 
+    debug_print(
+        f"Trading Post price cache: {cached_price_count:,} cached, "
+        f"{len(ids_to_fetch):,} to fetch."
+    )
+
     if ids_to_fetch:
-        print("Fetching Trading Post prices for missing materials...")
+        debug_print("Fetching Trading Post prices for missing materials...")
 
         for item_id in ids_to_fetch:
             price = fetch_price_for_item(item_id)
@@ -1048,6 +1087,88 @@ def get_price_estimates(
         save_price_cache(cache_path, cache)
 
     return price_estimates
+
+
+def template_path_from_reference(template_reference: str, templates_dir: Path) -> Path:
+    """Convert a simple template name into a templates/*.json path."""
+
+    template_name = str(template_reference).strip()
+
+    if not template_name:
+        raise ValueError("A target has an empty template reference.")
+
+    if "/" in template_name or "\\" in template_name:
+        raise ValueError(
+            f"Template reference '{template_name}' should be a simple name, "
+            "like 'klobjarne_geirr'."
+        )
+
+    if not template_name.endswith(".json"):
+        template_name = f"{template_name}.json"
+
+    return templates_dir / template_name
+
+
+def load_template(template_reference: str, templates_dir: Path) -> dict[str, Any]:
+    """Load one recipe template JSON file."""
+
+    template_path = template_path_from_reference(template_reference, templates_dir)
+
+    if not template_path.exists():
+        raise FileNotFoundError(f"Template file not found: {template_path}")
+
+    with template_path.open("r", encoding="utf-8") as template_file:
+        template = json.load(template_file)
+
+    if not isinstance(template, dict):
+        raise ValueError(f"Template {template_path} must contain one JSON object.")
+
+    return template
+
+
+def merge_template_target(template: dict[str, Any], target: dict[str, Any]) -> dict[str, Any]:
+    """Merge one template with one target from legendary_goals.json."""
+
+    merged_target = dict(template)
+
+    # List fields are additive by default. This lets a template provide the base
+    # recipe while legendary_goals.json adds personal notes or extra reminders.
+    for list_field in ("steps", "materials", "currencies"):
+        merged_target[list_field] = list(template.get(list_field, [])) + list(
+            target.get(list_field, [])
+        )
+
+    for key, value in target.items():
+        if key in {"steps", "materials", "currencies"}:
+            continue
+
+        merged_target[key] = value
+
+    return merged_target
+
+
+def expand_goal_templates(
+    targets: list[dict[str, Any]],
+    templates_dir: Path,
+) -> list[dict[str, Any]]:
+    """Replace template references with full target data."""
+
+    expanded_targets: list[dict[str, Any]] = []
+
+    for target in targets:
+        if not isinstance(target, dict):
+            raise ValueError("Every target in legendary_goals.json must be an object.")
+
+        template_reference = target.get("template")
+
+        if not template_reference:
+            expanded_targets.append(target)
+            continue
+
+        template = load_template(str(template_reference), templates_dir)
+        expanded_targets.append(merge_template_target(template, target))
+
+    return expanded_targets
 
 
 def load_goals(config_path: Path) -> list[dict[str, Any]]:
@@ -1064,6 +1185,7 @@ def load_goals(config_path: Path) -> list[dict[str, Any]]:
     if not isinstance(targets, list):
         raise ValueError("legendary_goals.json must contain a list named 'targets'.")
 
+    targets = expand_goal_templates(targets, DEFAULT_TEMPLATES_DIR)
     return [target for target in targets if target.get("enabled", True)]
 
 
@@ -1420,6 +1542,98 @@ def build_rule_recommendations(
     return recommendations
 
 
+def target_recipe_status_needs_work(target: dict[str, Any]) -> bool:
+    """Check whether a template says its recipe data still needs verification."""
+
+    recipe_status = str(target.get("recipe_status", "")).strip().casefold()
+    return recipe_status not in {"", "complete", "verified"}
+
+
+def step_is_configuration_work(step: dict[str, Any]) -> bool:
+    """Guess whether a checklist step is about setup/recipe data instead of play."""
+
+    step_text = normalize_item_name(f"{step['name']} {step.get('notes', '')}")
+    setup_words = (
+        "todo",
+        "verify",
+        "recipe",
+        "final item id",
+        "final_item_id",
+        "configuration",
+        "template",
+        "exact material",
+    )
+    return any(word in step_text for word in setup_words)
+
+
+def split_incomplete_steps(
+    steps: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Separate incomplete checklist steps into setup work and play/checklist work."""
+
+    configuration_steps: list[dict[str, Any]] = []
+    gameplay_steps: list[dict[str, Any]] = []
+
+    for step in steps:
+        if step["complete"]:
+            continue
+
+        if step_is_configuration_work(step):
+            configuration_steps.append(step)
+        else:
+            gameplay_steps.append(step)
+
+    return configuration_steps, gameplay_steps
+
+
+def target_needs_recipe_data(
+    target: dict[str, Any],
+    material_entries: list[dict[str, Any]],
+    currency_entries: list[dict[str, Any]],
+    configuration_steps: list[dict[str, Any]],
+) -> bool:
+    """Decide whether a target still needs recipe/configuration data."""
+
+    if target_recipe_status_needs_work(target):
+        return True
+
+    has_goal_entries = bool(material_entries or currency_entries)
+
+    if not has_goal_entries and configuration_steps:
+        return True
+
+    # A target with no API-tracked requirements and no armory unlock cannot be
+    # proven complete, so treat it as needing recipe data.
+    if not has_goal_entries and not target.get("steps"):
+        return True
+
+    return False
+
+
+def target_status_label(
+    is_unlocked: bool,
+    needs_recipe_data: bool,
+    missing_items: list[dict[str, Any]],
+    missing_currencies: list[dict[str, Any]],
+    incomplete_steps: list[dict[str, Any]],
+) -> str:
+    """Return the short status label shown beside a target."""
+
+    if is_unlocked:
+        return "Complete"
+
+    if needs_recipe_data:
+        return "Needs recipe data"
+
+    if missing_items or missing_currencies:
+        return "In progress"
+
+    if incomplete_steps:
+        return "Needs manual checklist work"
+
+    return "Complete"
+
+
 def build_target_status(
     target: dict[str, Any],
     wallet: dict[int, int],
@@ -1443,22 +1657,48 @@ def build_target_status(
         ("currency_id", "id"),
         "currencies",
     )
+    steps = normalize_steps(target_name, target.get("steps", []))
+    incomplete_steps = [step for step in steps if not step["complete"]]
+    configuration_steps, gameplay_steps = split_incomplete_steps(steps)
+    missing_items = get_missing_entries(
+        material_entries,
+        item_counts,
+        item_names,
+        "Item",
+    )
+    missing_currencies = get_missing_entries(
+        currency_entries,
+        wallet,
+        currency_names,
+        "Currency",
+    )
+    is_unlocked = is_target_unlocked(target, legendary_armory)
+    needs_recipe_data = target_needs_recipe_data(
+        target,
+        material_entries,
+        currency_entries,
+        configuration_steps,
+    )
 
     return {
         "target": target,
         "name": target_name,
-        "is_unlocked": is_target_unlocked(target, legendary_armory),
-        "missing_items": get_missing_entries(
-            material_entries,
-            item_counts,
-            item_names,
-            "Item",
-        ),
-        "missing_currencies": get_missing_entries(
-            currency_entries,
-            wallet,
-            currency_names,
-            "Currency",
+        "is_unlocked": is_unlocked,
+        "material_entries": material_entries,
+        "currency_entries": currency_entries,
+        "steps": steps,
+        "incomplete_steps": incomplete_steps,
+        "configuration_steps": configuration_steps,
+        "gameplay_steps": gameplay_steps,
+        "needs_recipe_data": needs_recipe_data,
+        "missing_items": missing_items,
+        "missing_currencies": missing_currencies,
+        "status_label": target_status_label(
+            is_unlocked,
+            needs_recipe_data,
+            missing_items,
+            missing_currencies,
+            incomplete_steps,
         ),
     }
 
@@ -1495,11 +1735,15 @@ def make_step_lines(
     target_name: str,
     steps: list[dict[str, Any]],
     show_complete: bool,
+    detailed: bool = False,
 ) -> list[str]:
     """Build report lines for manual checklist steps."""
 
     if not steps:
-        return ["    No manual steps listed."]
+        if detailed:
+            return ["    No manual steps listed."]
+
+        return []
 
     normalized_steps = normalize_steps(target_name, steps)
     visible_steps = [
@@ -1507,7 +1751,10 @@ def make_step_lines(
     ]
 
     if not visible_steps:
-        return ["    No incomplete manual steps."]
+        if detailed:
+            return ["    No incomplete manual steps."]
+
+        return []
 
     lines: list[str] = []
 
@@ -1529,13 +1776,17 @@ def make_missing_lines(
     api_names: dict[int, str],
     fallback_label: str,
     show_complete: bool,
+    detailed: bool = False,
 ) -> list[str]:
     """Build report lines for one group, such as materials or currencies."""
 
     lines: list[str] = []
 
     if not entries:
-        return ["    No goals listed in this section."]
+        if detailed:
+            return ["    No goals listed in this section."]
+
+        return []
 
     missing_count = 0
 
@@ -1548,12 +1799,20 @@ def make_missing_lines(
 
         if missing > 0:
             missing_count += 1
-            lines.append(f"    - {name}: missing {missing:,} (have {owned:,}, need {needed:,})")
+            missing_text = format_goal_amount(entry_id, missing, fallback_label)
+            owned_text = format_goal_amount(entry_id, owned, fallback_label)
+            needed_text = format_goal_amount(entry_id, needed, fallback_label)
+            lines.append(
+                f"    - {name}: missing {missing_text} "
+                f"(have {owned_text}, need {needed_text})"
+            )
             add_source_hint_line(lines, entry)
         elif show_complete:
-            lines.append(f"    - {name}: complete (have {owned:,}, need {needed:,})")
+            owned_text = format_goal_amount(entry_id, owned, fallback_label)
+            needed_text = format_goal_amount(entry_id, needed, fallback_label)
+            lines.append(f"    - {name}: complete (have {owned_text}, need {needed_text})")
 
-    if missing_count == 0 and not show_complete:
+    if missing_count == 0 and not show_complete and detailed:
         lines.append("    Nothing missing here.")
 
     return lines
@@ -1574,13 +1833,17 @@ def make_missing_item_lines(
     api_names: dict[int, str],
     show_complete: bool,
     price_estimates: dict[int, dict[str, Any]] | None,
+    detailed: bool = False,
 ) -> list[str]:
     """Build missing item lines, optionally adding Trading Post estimates."""
 
     lines: list[str] = []
 
     if not entries:
-        return ["    No goals listed in this section."]
+        if detailed:
+            return ["    No goals listed in this section."]
+
+        return []
 
     missing_count = 0
 
@@ -1596,14 +1859,20 @@ def make_missing_item_lines(
             line = f"    - {name}: missing {missing:,} (have {owned:,}, need {needed:,})"
 
             if price_estimates is not None:
-                line += f" - {price_text_for_missing_entry({'id': entry_id, 'missing': missing}, price_estimates)}"
+                price_text = price_text_for_missing_entry(
+                    {"id": entry_id, "missing": missing},
+                    price_estimates,
+                )
+
+                if price_text != "not priced":
+                    line += f" - {price_text}"
 
             lines.append(line)
             add_source_hint_line(lines, entry)
         elif show_complete:
             lines.append(f"    - {name}: complete (have {owned:,}, need {needed:,})")
 
-    if missing_count == 0 and not show_complete:
+    if missing_count == 0 and not show_complete and detailed:
         lines.append("    Nothing missing here.")
 
     return lines
@@ -1620,6 +1889,7 @@ def add_price_summary_lines(
         return
 
     total_copper = 0
+    priced_count = 0
     not_priced_entries = []
 
     for entry in missing_entries:
@@ -1629,9 +1899,14 @@ def add_price_summary_lines(
             not_priced_entries.append(entry)
             continue
 
+        priced_count += 1
         total_copper += int(price["sell_unit_price"]) * int(entry["missing"])
 
-    lines.append(f"  Estimated buy-now cost for priced missing items: {format_coin(total_copper)}")
+    if priced_count:
+        lines.append(
+            "  Estimated buy-now cost for priced missing items: "
+            f"{format_coin(total_copper)}"
+        )
 
     if not_priced_entries:
         lines.append("  Not priced:")
@@ -1646,8 +1921,16 @@ def add_already_unlocked_section(
     legendary_armory: dict[int, int],
     armory_summary: dict[str, Any],
     item_names: dict[int, str],
+    detailed: bool = False,
 ) -> None:
     """Add a report section for configured targets already in the Legendary Armory."""
+
+    unlocked_targets = [
+        target for target in targets if is_target_unlocked(target, legendary_armory)
+    ]
+
+    if not detailed and not unlocked_targets:
+        return
 
     lines.append("Already unlocked legendaries")
 
@@ -1655,10 +1938,6 @@ def add_already_unlocked_section(
         lines.append(f"  Skipped: {armory_summary['skipped_reason']}")
         lines.append("")
         return
-
-    unlocked_targets = [
-        target for target in targets if is_target_unlocked(target, legendary_armory)
-    ]
 
     if not unlocked_targets:
         lines.append("  No configured targets with final_item_id are unlocked yet.")
@@ -1675,6 +1954,71 @@ def add_already_unlocked_section(
     lines.append("")
 
 
+def step_recommendation_text(step: dict[str, Any]) -> str:
+    """Turn one incomplete manual step into a short recommendation."""
+
+    recommendation = f"Checklist: {step['name']}."
+
+    if step.get("notes"):
+        recommendation += f" {step['notes']}"
+
+    return recommendation
+
+
+def build_gameplay_recommendations(
+    target_status: dict[str, Any],
+    price_estimates: dict[int, dict[str, Any]] | None,
+) -> list[str]:
+    """Build recommendations that point to actual in-game progress."""
+
+    recommendations = build_rule_recommendations(
+        target_status["name"],
+        target_status["missing_items"],
+        target_status["missing_currencies"],
+        price_estimates,
+    )
+
+    for step in target_status["gameplay_steps"]:
+        recommendations.append(step_recommendation_text(step))
+
+    if not recommendations and (
+        target_status["missing_items"] or target_status["missing_currencies"]
+    ):
+        biggest_missing = sorted(
+            target_status["missing_items"] + target_status["missing_currencies"],
+            key=lambda entry: entry["missing"],
+            reverse=True,
+        )[0]
+        recommendations.append(
+            f"No special daily rule matched. Work on {biggest_missing['name']} first."
+        )
+
+    return recommendations
+
+
+def build_configuration_recommendations(target_status: dict[str, Any]) -> list[str]:
+    """Build recommendations for recipe/template TODOs and setup work."""
+
+    recommendations: list[str] = []
+
+    if target_recipe_status_needs_work(target_status["target"]):
+        recommendations.append(
+            f"Recipe data: verify {target_status['name']}'s template, then fill in "
+            "exact materials, currencies, and final_item_id where known."
+        )
+
+    for step in target_status["configuration_steps"]:
+        recommendations.append(step_recommendation_text(step))
+
+    # Keep repeated template TODOs from making the recommendation block noisy.
+    unique_recommendations: list[str] = []
+    for recommendation in recommendations:
+        if recommendation not in unique_recommendations:
+            unique_recommendations.append(recommendation)
+
+    return unique_recommendations
+
+
 def add_recommended_today_section(
     lines: list[str],
     targets: list[dict[str, Any]],
@@ -1684,6 +2028,7 @@ def add_recommended_today_section(
     item_names: dict[int, str],
     currency_names: dict[int, str],
     price_estimates: dict[int, dict[str, Any]] | None,
+    detailed: bool = False,
 ) -> None:
     """Add focused recommendations for the first incomplete target, plus future notes."""
 
@@ -1701,62 +2046,69 @@ def add_recommended_today_section(
     incomplete_indexes = [
         index
         for index, status in enumerate(target_statuses)
-        if not status["is_unlocked"]
-        and (status["missing_items"] or status["missing_currencies"])
+        if not status["is_unlocked"] and status["status_label"] != "Complete"
     ]
 
     lines.append("Recommended today")
 
     if not incomplete_indexes:
-        lines.append("  No missing items or currencies found for incomplete targets.")
+        lines.append("  No gameplay or configuration recommendations today.")
         lines.append("")
         return
 
     main_index = incomplete_indexes[0]
     main_status = target_statuses[main_index]
-    main_recommendations = build_rule_recommendations(
-        main_status["name"],
-        main_status["missing_items"],
-        main_status["missing_currencies"],
-        price_estimates,
-    )
+    main_gameplay = build_gameplay_recommendations(main_status, price_estimates)
+    main_configuration = build_configuration_recommendations(main_status)
 
-    lines.append(f"  Main target: {main_status['name']}")
+    lines.append(f"  Main target: {main_status['name']} [{main_status['status_label']}]")
 
-    if main_recommendations:
-        for recommendation in main_recommendations:
+    if main_gameplay:
+        lines.append("  Gameplay:")
+        for recommendation in main_gameplay:
             lines.append(f"    - {recommendation}")
-    else:
-        biggest_missing = sorted(
-            main_status["missing_items"] + main_status["missing_currencies"],
-            key=lambda entry: entry["missing"],
-            reverse=True,
-        )[0]
-        lines.append(
-            f"    - No special daily rule matched. Work on {biggest_missing['name']} first."
-        )
+    elif detailed:
+        lines.append("  Gameplay: no gameplay recommendations for this target.")
 
-    future_lines = []
+    if main_configuration:
+        lines.append("  Configuration:")
+        for recommendation in main_configuration:
+            lines.append(f"    - {recommendation}")
+    elif detailed:
+        lines.append("  Configuration: no configuration recommendations for this target.")
+
+    future_gameplay_lines = []
+    future_configuration_lines = []
+    future_recommendation_limit = 2 if detailed else 1
 
     for future_index in incomplete_indexes[1:]:
         future_status = target_statuses[future_index]
-        future_recommendations = build_rule_recommendations(
-            future_status["name"],
-            future_status["missing_items"],
-            future_status["missing_currencies"],
-            price_estimates,
-        )
+        future_gameplay = build_gameplay_recommendations(future_status, price_estimates)
+        future_configuration = build_configuration_recommendations(future_status)
 
-        if future_recommendations:
-            future_lines.append(
-                f"    - {future_status['name']}: {'; '.join(future_recommendations[:2])}"
+        if future_gameplay:
+            future_gameplay_lines.append(
+                f"    - {future_status['name']}: "
+                f"{'; '.join(future_gameplay[:future_recommendation_limit])}"
             )
 
-    if future_lines:
-        lines.append("  Secondary recommendations for future targets:")
-        lines.extend(future_lines)
-    else:
-        lines.append("  Secondary recommendations for future targets: none from today's rules.")
+        if future_configuration:
+            future_configuration_lines.append(
+                f"    - {future_status['name']}: "
+                f"{'; '.join(future_configuration[:future_recommendation_limit])}"
+            )
+
+    if future_gameplay_lines:
+        lines.append("  Future gameplay:")
+        lines.extend(future_gameplay_lines)
+    elif detailed:
+        lines.append("  Future gameplay: none from today's rules.")
+
+    if future_configuration_lines:
+        lines.append("  Future configuration:")
+        lines.extend(future_configuration_lines)
+    elif detailed:
+        lines.append("  Future configuration: none.")
 
     lines.append("")
 
@@ -1772,28 +2124,51 @@ def build_report(
     currency_names: dict[int, str],
     show_complete: bool,
     price_estimates: dict[int, dict[str, Any]] | None,
+    output_mode: str = OUTPUT_MODE_SUMMARY,
 ) -> str:
     """Create the final text report."""
+
+    detailed = output_mode in {OUTPUT_MODE_DETAILED, OUTPUT_MODE_DEBUG}
+    character_cache_summary = next(
+        (
+            source.removeprefix("character inventories (").removesuffix(")")
+            for source in scan_summary["scanned_sources"]
+            if source.startswith("character inventories (")
+        ),
+        "",
+    )
 
     lines = [
         "Guild Wars 2 Legendary Planner",
         "================================",
-        f"Wallet currencies fetched: {len(wallet):,}",
-        f"Combined item IDs counted: {len(item_counts):,}",
+        f"Scan summary: {len(wallet):,} wallet currencies, {len(item_counts):,} item IDs counted.",
     ]
 
-    if scan_summary["scanned_sources"]:
+    if character_cache_summary:
+        lines.append(f"Character inventories: {character_cache_summary}")
+
+    if scan_summary["skipped_sources"]:
+        lines.append(f"Skipped: {'; '.join(scan_summary['skipped_sources'])}")
+
+    if detailed and scan_summary["scanned_sources"]:
         lines.append("Scanned item sources:")
         for source in scan_summary["scanned_sources"]:
             lines.append(f"  - {source}")
 
-    if scan_summary["skipped_sources"]:
+    if detailed and scan_summary["skipped_sources"]:
         lines.append("Skipped item sources:")
         for source in scan_summary["skipped_sources"]:
             lines.append(f"  - {source}")
 
     lines.append("")
-    add_already_unlocked_section(lines, targets, legendary_armory, armory_summary, item_names)
+    add_already_unlocked_section(
+        lines,
+        targets,
+        legendary_armory,
+        armory_summary,
+        item_names,
+        detailed=detailed,
+    )
 
     if not targets:
         lines.extend(
@@ -1813,65 +2188,88 @@ def build_report(
         item_names,
         currency_names,
         price_estimates,
+        detailed=detailed,
     )
 
-    for target in targets:
-        target_name = target.get("name", "Unnamed target")
+    for target_number, target in enumerate(targets, start=1):
+        target_status = build_target_status(
+            target,
+            wallet,
+            item_counts,
+            legendary_armory,
+            item_names,
+            currency_names,
+        )
+        target_name = target_status["name"]
         final_item_id = target_final_item_id(target)
-        target_is_unlocked = is_target_unlocked(target, legendary_armory)
 
-        if target_is_unlocked:
+        lines.append(
+            f"Target {target_number}: {target_name} [{target_status['status_label']}]"
+        )
+
+        if target_status["is_unlocked"]:
             final_item_name = item_names.get(final_item_id, f"Item {final_item_id}")
-            lines.append(f"Target: {target_name} - complete")
             lines.append(f"  Already unlocked in Legendary Armory: {final_item_name}")
-            lines.append("  Manual checklist steps:")
-            lines.extend(make_step_lines(target_name, target.get("steps", []), show_complete))
+            step_lines = make_step_lines(
+                target_name,
+                target.get("steps", []),
+                show_complete,
+                detailed=detailed,
+            )
+
+            if step_lines:
+                lines.append("  Manual checklist steps:")
+                lines.extend(step_lines)
+
             lines.append("")
             continue
 
-        material_entries = normalize_goal_entries(
+        step_lines = make_step_lines(
             target_name,
-            target.get("materials", []),
-            ("item_id", "id"),
-            "materials",
-        )
-        currency_entries = normalize_goal_entries(
-            target_name,
-            target.get("currencies", []),
-            ("currency_id", "id"),
-            "currencies",
+            target.get("steps", []),
+            show_complete,
+            detailed=detailed,
         )
 
-        lines.append(f"Target: {target_name}")
-        lines.append("  Manual checklist steps:")
-        lines.extend(make_step_lines(target_name, target.get("steps", []), show_complete))
-        lines.append("  Missing items from account storage and inventories:")
-        lines.extend(
-            make_missing_item_lines(
-                material_entries,
-                item_counts,
-                item_names,
-                show_complete,
-                price_estimates,
-            )
-        )
-        missing_material_entries = get_missing_entries(
-            material_entries,
+        if step_lines:
+            lines.append("  Manual checklist steps:")
+            lines.extend(step_lines)
+
+        item_lines = make_missing_item_lines(
+            target_status["material_entries"],
             item_counts,
             item_names,
-            "Item",
+            show_complete,
+            price_estimates,
+            detailed=detailed,
         )
-        add_price_summary_lines(lines, missing_material_entries, price_estimates)
-        lines.append("  Missing wallet currencies:")
-        lines.extend(
-            make_missing_lines(
-                currency_entries,
-                wallet,
-                currency_names,
-                "Currency",
-                show_complete,
-            )
+
+        if item_lines:
+            lines.append("  Missing items from account storage and inventories:")
+            lines.extend(item_lines)
+
+        add_price_summary_lines(
+            lines,
+            target_status["missing_items"],
+            price_estimates,
         )
+
+        currency_lines = make_missing_lines(
+            target_status["currency_entries"],
+            wallet,
+            currency_names,
+            "Currency",
+            show_complete,
+            detailed=detailed,
+        )
+
+        if currency_lines:
+            lines.append("  Missing wallet currencies:")
+            lines.extend(currency_lines)
+
+        if detailed and not step_lines and not item_lines and not currency_lines:
+            lines.append("  No visible details for this target.")
+
         lines.append("")
 
     return "\n".join(lines).rstrip()
@@ -1904,6 +2302,16 @@ def parse_args() -> argparse.Namespace:
         help="Also show goals that are already complete.",
     )
     parser.add_argument(
+        "--detailed",
+        action="store_true",
+        help="Show fuller target details, including useful empty sections.",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Show API, scan, and cache details for troubleshooting.",
+    )
+    parser.add_argument(
         "--no-prices",
         action="store_true",
         help="Skip Trading Post price estimates.",
@@ -1924,12 +2332,23 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     """Program entry point."""
 
+    global DEBUG_OUTPUT
+
     args = parse_args()
+    output_mode = OUTPUT_MODE_SUMMARY
+
+    if args.detailed:
+        output_mode = OUTPUT_MODE_DETAILED
+
+    if args.debug:
+        output_mode = OUTPUT_MODE_DEBUG
+
+    DEBUG_OUTPUT = output_mode == OUTPUT_MODE_DEBUG
 
     try:
         api_key = find_api_key(Path(args.env) if args.env else None)
 
-        print("Checking API key permissions...")
+        debug_print("Checking API key permissions...")
         token_permissions = fetch_token_permissions(api_key)
         warn_about_missing_permissions(token_permissions)
 
@@ -1948,22 +2367,22 @@ def main() -> int:
         }
 
         if "unlocks" in token_permissions:
-            print("Checking Legendary Armory unlocks...")
+            debug_print("Checking Legendary Armory unlocks...")
             legendary_armory = fetch_legendary_armory(api_key)
             armory_summary = {
                 "scanned": True,
                 "skipped_reason": "",
             }
         else:
-            print("Skipping Legendary Armory because the API key is missing unlocks permission.")
+            debug_print("Skipping Legendary Armory because the API key is missing unlocks permission.")
 
         wallet: dict[int, int] = {}
 
         if "wallet" in token_permissions:
-            print("Fetching wallet currencies from the official GW2 API...")
+            debug_print("Fetching wallet currencies from the official GW2 API...")
             wallet = fetch_wallet(api_key)
         else:
-            print("Skipping wallet currencies because the API key is missing wallet permission.")
+            debug_print("Skipping wallet currencies because the API key is missing wallet permission.")
 
         item_counts, scan_summary = build_combined_item_counts(
             api_key,
@@ -1976,7 +2395,7 @@ def main() -> int:
         price_estimates = None
 
         if args.no_prices:
-            print("Skipping Trading Post prices because --no-prices was used.")
+            debug_print("Skipping Trading Post prices because --no-prices was used.")
         else:
             missing_item_ids = collect_missing_item_ids(targets, item_counts, legendary_armory)
             price_estimates = get_price_estimates(missing_item_ids, DEFAULT_PRICE_CACHE_PATH)
@@ -1995,9 +2414,9 @@ def main() -> int:
             currency_names,
             args.show_complete,
             price_estimates,
+            output_mode=output_mode,
         )
 
-        print()
         print(report)
 
         if args.output:

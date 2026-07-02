@@ -1,0 +1,19 @@
+{
+  "name": "Legendary Rune set",
+  "final_item_id": null,
+  "recipe_status": "needs_verification",
+  "steps": [
+    {
+      "name": "TODO: Verify Legendary Rune set size and final_item_id handling",
+      "complete": false,
+      "notes": "A rune set may need multiple crafted runes; verify the exact count and whether armory detection should use one item ID or several."
+    },
+    {
+      "name": "TODO: Verify full Legendary Rune recipe quantities",
+      "complete": false,
+      "notes": "Confirm exact charms, symbols, gifts, Mystic Clover, and account-bound requirements before adding materials."
+    }
+  ],
+  "materials": [],
+  "currencies": []
+}
