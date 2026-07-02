@@ -6,3 +6,4 @@ __pycache__/
 reports/
 item_cache.json
 price_cache.json
+API_Key.env

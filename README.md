@@ -21,6 +21,7 @@ Requires Python 3.10 or newer.
    - `wallet`
    - `inventories`
    - `characters`
+   - `unlocks`
 
 3. Edit `legendary_goals.json` with the materials and currencies you want to track.
 
@@ -52,7 +53,9 @@ python gw2_legendary_planner.py --output reports/missing-materials.txt
 
 ## Config Format
 
-Each target can have `materials` and `currencies`.
+Each target can have `materials`, `currencies`, and an optional `final_item_id`.
+
+Use `final_item_id` for the finished legendary item. If that item is already in your Legendary Armory, the app marks the target as complete.
 
 ```json
 {
@@ -60,6 +63,7 @@ Each target can have `materials` and `currencies`.
     {
       "name": "My Legendary",
       "enabled": true,
+      "final_item_id": 30684,
       "materials": [
         {
           "name": "Mystic Clover",
@@ -88,6 +92,8 @@ Each target can have `materials` and `currencies`.
 - The script does not print your API key.
 - The script sends the API key in an Authorization header, not in the URL.
 - Before scanning, the script checks `/v2/tokeninfo` and warns if the key is missing needed permissions.
+- Legendary Armory unlocks come from `/v2/account/legendaryarmory`.
+- Targets with `final_item_id` are marked complete when that item is already unlocked.
 - Item counts combine material storage, bank slots, shared inventory slots, and every character's bag inventory.
 - Name-only materials must match one item clearly. If the name is missing or matches multiple items, the app will ask you to fix the spelling or use `item_id`.
 - Trading Post estimates use the lowest sell price as the buy-now price.

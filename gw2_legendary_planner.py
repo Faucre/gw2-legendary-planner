@@ -45,7 +45,8 @@ API_KEY_VARIABLES = (
 # - wallet: reads account currencies such as Karma.
 # - inventories: reads material storage, bank, shared inventory, and bag contents.
 # - characters: lists characters so we can scan each character's bags.
-REQUIRED_PERMISSIONS = ("wallet", "inventories", "characters")
+# - unlocks: reads unlocked account items, including the Legendary Armory.
+REQUIRED_PERMISSIONS = ("wallet", "inventories", "characters", "unlocks")
 
 
 class Gw2ApiError(Exception):
@@ -155,7 +156,7 @@ def api_get(path: str, api_key: str | None = None, params: dict[str, Any] | None
         if error.code in {401, 403}:
             message += (
                 " Check that your API key is valid and has wallet, inventories, "
-                "and characters permissions."
+                "characters, and unlocks permissions."
             )
 
         if body:
@@ -227,6 +228,27 @@ def fetch_character_inventory(api_key: str, character_name: str) -> dict[str, An
 
     safe_character_name = quote(character_name, safe="")
     return api_get(f"/characters/{safe_character_name}/inventory", api_key=api_key)
+
+
+def fetch_legendary_armory(api_key: str) -> dict[int, int]:
+    """Fetch Legendary Armory unlocks and return {item_id: unlocked_count}."""
+
+    armory_rows = api_get("/account/legendaryarmory", api_key=api_key)
+    unlocked_legendaries: dict[int, int] = {}
+
+    for row in armory_rows:
+        if not row:
+            continue
+
+        item_id = row.get("id")
+        count = row.get("count", 1)
+
+        if item_id is None:
+            continue
+
+        unlocked_legendaries[int(item_id)] = unlocked_legendaries.get(int(item_id), 0) + int(count)
+
+    return unlocked_legendaries
 
 
 def add_item_count(item_counts: dict[int, int], item_id: int, count: int) -> None:
@@ -802,7 +824,37 @@ def collect_goal_ids(targets: list[dict[str, Any]]) -> tuple[set[int], set[int]]
         item_ids.update(entry["id"] for entry in material_entries)
         currency_ids.update(entry["id"] for entry in currency_entries)
 
+        final_item_id = target.get("final_item_id")
+
+        if final_item_id is not None:
+            item_ids.add(int(final_item_id))
+
     return item_ids, currency_ids
+
+
+def target_final_item_id(target: dict[str, Any]) -> int | None:
+    """Return a target's optional final legendary item ID."""
+
+    final_item_id = target.get("final_item_id")
+
+    if final_item_id is None:
+        return None
+
+    return int(final_item_id)
+
+
+def is_target_unlocked(
+    target: dict[str, Any],
+    legendary_armory: dict[int, int],
+) -> bool:
+    """Check whether this target's final legendary is already unlocked."""
+
+    final_item_id = target_final_item_id(target)
+
+    if final_item_id is None:
+        return False
+
+    return legendary_armory.get(final_item_id, 0) > 0
 
 
 def get_missing_entries(
@@ -839,12 +891,16 @@ def get_missing_entries(
 def collect_missing_item_ids(
     targets: list[dict[str, Any]],
     item_counts: dict[int, int],
+    legendary_armory: dict[int, int],
 ) -> set[int]:
     """Collect item IDs that are missing from at least one enabled target."""
 
     missing_item_ids: set[int] = set()
 
     for target in targets:
+        if is_target_unlocked(target, legendary_armory):
+            continue
+
         target_name = target.get("name", "Unnamed target")
         material_entries = normalize_goal_entries(
             target_name,
@@ -981,11 +1037,48 @@ def add_price_summary_lines(
             lines.append(f"    - {entry['name']}: missing {entry['missing']:,}")
 
 
+def add_already_unlocked_section(
+    lines: list[str],
+    targets: list[dict[str, Any]],
+    legendary_armory: dict[int, int],
+    armory_summary: dict[str, Any],
+    item_names: dict[int, str],
+) -> None:
+    """Add a report section for configured targets already in the Legendary Armory."""
+
+    lines.append("Already unlocked legendaries")
+
+    if not armory_summary["scanned"]:
+        lines.append(f"  Skipped: {armory_summary['skipped_reason']}")
+        lines.append("")
+        return
+
+    unlocked_targets = [
+        target for target in targets if is_target_unlocked(target, legendary_armory)
+    ]
+
+    if not unlocked_targets:
+        lines.append("  No configured targets with final_item_id are unlocked yet.")
+        lines.append("")
+        return
+
+    for target in unlocked_targets:
+        final_item_id = target_final_item_id(target)
+        item_name = item_names.get(final_item_id, f"Item {final_item_id}")
+        unlocked_count = legendary_armory.get(final_item_id, 0)
+        count_text = f" ({unlocked_count} unlocked)" if unlocked_count > 1 else ""
+        lines.append(f"  - {target.get('name', 'Unnamed target')}: {item_name}{count_text}")
+
+    lines.append("")
+
+
 def build_report(
     targets: list[dict[str, Any]],
     wallet: dict[int, int],
     item_counts: dict[int, int],
     scan_summary: dict[str, list[str]],
+    legendary_armory: dict[int, int],
+    armory_summary: dict[str, Any],
     item_names: dict[int, str],
     currency_names: dict[int, str],
     show_complete: bool,
@@ -1011,6 +1104,7 @@ def build_report(
             lines.append(f"  - {source}")
 
     lines.append("")
+    add_already_unlocked_section(lines, targets, legendary_armory, armory_summary, item_names)
 
     if not targets:
         lines.extend(
@@ -1023,6 +1117,16 @@ def build_report(
 
     for target in targets:
         target_name = target.get("name", "Unnamed target")
+        final_item_id = target_final_item_id(target)
+        target_is_unlocked = is_target_unlocked(target, legendary_armory)
+
+        if target_is_unlocked:
+            final_item_name = item_names.get(final_item_id, f"Item {final_item_id}")
+            lines.append(f"Target: {target_name} - complete")
+            lines.append(f"  Already unlocked in Legendary Armory: {final_item_name}")
+            lines.append("")
+            continue
+
         material_entries = normalize_goal_entries(
             target_name,
             target.get("materials", []),
@@ -1118,6 +1222,22 @@ def main() -> int:
         targets = load_goals(Path(args.config))
         targets = resolve_goal_material_names(targets, DEFAULT_ITEM_CACHE_PATH)
 
+        legendary_armory: dict[int, int] = {}
+        armory_summary: dict[str, Any] = {
+            "scanned": False,
+            "skipped_reason": "missing unlocks permission",
+        }
+
+        if "unlocks" in token_permissions:
+            print("Checking Legendary Armory unlocks...")
+            legendary_armory = fetch_legendary_armory(api_key)
+            armory_summary = {
+                "scanned": True,
+                "skipped_reason": "",
+            }
+        else:
+            print("Skipping Legendary Armory because the API key is missing unlocks permission.")
+
         wallet: dict[int, int] = {}
 
         if "wallet" in token_permissions:
@@ -1134,7 +1254,7 @@ def main() -> int:
         if args.no_prices:
             print("Skipping Trading Post prices because --no-prices was used.")
         else:
-            missing_item_ids = collect_missing_item_ids(targets, item_counts)
+            missing_item_ids = collect_missing_item_ids(targets, item_counts, legendary_armory)
             price_estimates = get_price_estimates(missing_item_ids, DEFAULT_PRICE_CACHE_PATH)
 
         item_names = fetch_names("/items", item_ids) if item_ids else {}
@@ -1145,6 +1265,8 @@ def main() -> int:
             wallet,
             item_counts,
             scan_summary,
+            legendary_armory,
+            armory_summary,
             item_names,
             currency_names,
             args.show_complete,

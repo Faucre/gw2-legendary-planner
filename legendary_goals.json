@@ -9,6 +9,7 @@
     {
       "name": "Example Legendary Goal",
       "enabled": true,
+      "final_item_id": null,
       "materials": [
         {
           "item_id": 19721,
