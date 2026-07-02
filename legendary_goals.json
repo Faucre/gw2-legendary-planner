@@ -3,13 +3,25 @@
     "Replace this sample target with the legendary goals you want to track.",
     "Use item_id when you know it, or use an exact item name and the app will look it up.",
     "Use currency_id for wallet currencies like Karma.",
+    "Use source_hint on materials or currencies when you want a reminder of where to get them.",
     "The sample below is only a starter list, not a full legendary recipe."
   ],
   "targets": [
     {
-      "name": "Example Legendary Goal",
+      "name": "Klobjarne Geirr",
       "enabled": true,
       "final_item_id": null,
+      "steps": [
+        {
+          "name": "Finish time-gated daily materials",
+          "complete": false,
+          "notes": "Update manually when the cooldowns are done."
+        },
+        {
+          "name": "Craft final gift",
+          "complete": false
+        }
+      ],
       "materials": [
         {
           "item_id": 19721,
@@ -23,14 +35,16 @@
         {
           "item_id": 19925,
           "name": "Obsidian Shard",
-          "amount": 250
+          "amount": 250,
+          "source_hint": "Buy with Karma from vendors, or obtain from map currencies/reward tracks."
         }
       ],
       "currencies": [
         {
           "currency_id": 2,
           "name": "Karma",
-          "amount": 500000
+          "amount": 500000,
+          "source_hint": "Earn from events, daily Wizard's Vault objectives, and account boosts."
         }
       ]
     }

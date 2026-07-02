@@ -1172,6 +1172,7 @@ def normalize_goal_entries(
                 "id": int(entry_id),
                 "amount": int(amount),
                 "name": entry.get("name"),
+                "source_hint": str(entry.get("source_hint", "")).strip(),
             }
         )
 
@@ -1261,6 +1262,7 @@ def get_missing_entries(
                     "needed": needed,
                     "owned": owned,
                     "missing": missing,
+                    "source_hint": entry.get("source_hint", ""),
                 }
             )
 
@@ -1461,6 +1463,66 @@ def build_target_status(
     }
 
 
+def normalize_steps(target_name: str, steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Validate and simplify manual checklist steps."""
+
+    normalized_steps: list[dict[str, Any]] = []
+
+    if not isinstance(steps, list):
+        raise ValueError(f"Target '{target_name}' has steps, but steps must be a list.")
+
+    for step in steps:
+        if not isinstance(step, dict):
+            raise ValueError(f"Target '{target_name}' has a step that is not an object.")
+
+        step_name = str(step.get("name", "")).strip()
+
+        if not step_name:
+            raise ValueError(f"Target '{target_name}' has a step without a name.")
+
+        normalized_steps.append(
+            {
+                "name": step_name,
+                "complete": bool(step.get("complete", False)),
+                "notes": str(step.get("notes", "")).strip(),
+            }
+        )
+
+    return normalized_steps
+
+
+def make_step_lines(
+    target_name: str,
+    steps: list[dict[str, Any]],
+    show_complete: bool,
+) -> list[str]:
+    """Build report lines for manual checklist steps."""
+
+    if not steps:
+        return ["    No manual steps listed."]
+
+    normalized_steps = normalize_steps(target_name, steps)
+    visible_steps = [
+        step for step in normalized_steps if show_complete or not step["complete"]
+    ]
+
+    if not visible_steps:
+        return ["    No incomplete manual steps."]
+
+    lines: list[str] = []
+
+    for step in visible_steps:
+        status = "complete" if step["complete"] else "incomplete"
+        line = f"    - {step['name']}: {status}"
+
+        if step["notes"]:
+            line += f" - {step['notes']}"
+
+        lines.append(line)
+
+    return lines
+
+
 def make_missing_lines(
     entries: list[dict[str, Any]],
     owned_counts: dict[int, int],
@@ -1487,6 +1549,7 @@ def make_missing_lines(
         if missing > 0:
             missing_count += 1
             lines.append(f"    - {name}: missing {missing:,} (have {owned:,}, need {needed:,})")
+            add_source_hint_line(lines, entry)
         elif show_complete:
             lines.append(f"    - {name}: complete (have {owned:,}, need {needed:,})")
 
@@ -1494,6 +1557,15 @@ def make_missing_lines(
         lines.append("    Nothing missing here.")
 
     return lines
+
+
+def add_source_hint_line(lines: list[str], entry: dict[str, Any]) -> None:
+    """Add a clean source hint line when a goal entry provides one."""
+
+    source_hint = str(entry.get("source_hint", "")).strip()
+
+    if source_hint:
+        lines.append(f"      Source hint: {source_hint}")
 
 
 def make_missing_item_lines(
@@ -1527,6 +1599,7 @@ def make_missing_item_lines(
                 line += f" - {price_text_for_missing_entry({'id': entry_id, 'missing': missing}, price_estimates)}"
 
             lines.append(line)
+            add_source_hint_line(lines, entry)
         elif show_complete:
             lines.append(f"    - {name}: complete (have {owned:,}, need {needed:,})")
 
@@ -1751,6 +1824,8 @@ def build_report(
             final_item_name = item_names.get(final_item_id, f"Item {final_item_id}")
             lines.append(f"Target: {target_name} - complete")
             lines.append(f"  Already unlocked in Legendary Armory: {final_item_name}")
+            lines.append("  Manual checklist steps:")
+            lines.extend(make_step_lines(target_name, target.get("steps", []), show_complete))
             lines.append("")
             continue
 
@@ -1768,6 +1843,8 @@ def build_report(
         )
 
         lines.append(f"Target: {target_name}")
+        lines.append("  Manual checklist steps:")
+        lines.extend(make_step_lines(target_name, target.get("steps", []), show_complete))
         lines.append("  Missing items from account storage and inventories:")
         lines.extend(
             make_missing_item_lines(

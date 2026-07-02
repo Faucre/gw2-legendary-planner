@@ -69,9 +69,11 @@ The report includes a `Recommended today` section. It looks at the first incompl
 
 ## Config Format
 
-Each target can have `materials`, `currencies`, and an optional `final_item_id`.
+Each target can have `materials`, `currencies`, manual `steps`, and an optional `final_item_id`.
 
 Use `final_item_id` for the finished legendary item. If that item is already in your Legendary Armory, the app marks the target as complete.
+
+Use `steps` for manual checklist items that are not API materials or wallet currencies.
 
 ```json
 {
@@ -80,6 +82,17 @@ Use `final_item_id` for the finished legendary item. If that item is already in 
       "name": "My Legendary",
       "enabled": true,
       "final_item_id": 30684,
+      "steps": [
+        {
+          "name": "Finish time-gated daily materials",
+          "complete": false,
+          "notes": "Update manually when the cooldowns are done."
+        },
+        {
+          "name": "Craft final gift",
+          "complete": false
+        }
+      ],
       "materials": [
         {
           "name": "Mystic Clover",
@@ -89,13 +102,19 @@ Use `final_item_id` for the finished legendary item. If that item is already in 
           "item_id": 19721,
           "name": "Glob of Ectoplasm",
           "amount": 250
+        },
+        {
+          "name": "Obsidian Shard",
+          "amount": 250,
+          "source_hint": "Buy with Karma from vendors, or obtain from map currencies/reward tracks."
         }
       ],
       "currencies": [
         {
           "currency_id": 2,
           "name": "Karma",
-          "amount": 500000
+          "amount": 500000,
+          "source_hint": "Earn from events, daily Wizard's Vault objectives, and account boosts."
         }
       ]
     }
@@ -111,6 +130,9 @@ Use `final_item_id` for the finished legendary item. If that item is already in 
 - Before scanning, the script checks `/v2/tokeninfo` and warns if the key is missing needed permissions.
 - Legendary Armory unlocks come from `/v2/account/legendaryarmory`.
 - Targets with `final_item_id` are marked complete when that item is already unlocked.
+- Manual `steps` are shown in the report but are not counted as item IDs or wallet currencies.
+- Completed manual steps are shown only when you run with `--show-complete`.
+- Optional `source_hint` text is shown under missing materials or currencies.
 - Item counts combine material storage, bank slots, shared inventory slots, and every character's bag inventory.
 - Wallet, material storage, bank, and shared inventory are fetched fresh every run.
 - Character bag inventories are cached in `character_inventory_cache.json` and reused when a character's `age` value has not changed.
