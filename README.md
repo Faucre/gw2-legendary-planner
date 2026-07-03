@@ -70,6 +70,30 @@ python gw2_legendary_planner.py --explain-missing "Klobjarne Geirr" "Orichalcum 
 Explain output includes the category, confidence label, amount still missing,
 and recipe path such as `Klobjarne Geirr > Gift of the Homesteader > Mystic Clover`.
 
+For the acquisition-focused action plan:
+
+```bash
+python gw2_legendary_planner.py --action-plan "Klobjarne Geirr"
+```
+
+To plan from the first enabled priority target:
+
+```bash
+python gw2_legendary_planner.py --action-plan-priority
+```
+
+The action plan groups missing requirements into practical buckets:
+priority blockers, do-today tasks, buy/vendor items, farm/gather items,
+crafting work, and manual review. It keeps confidence/review labels and does
+not pretend unknown costs are verified.
+
+To inspect acquisition options for one missing item:
+
+```bash
+python gw2_legendary_planner.py --show-options "Klobjarne Geirr" "Mystic Clover"
+python gw2_legendary_planner.py --show-options "Klobjarne Geirr" "Mystic Runestone"
+```
+
 To also show completed entries:
 
 ```bash

@@ -12,9 +12,13 @@ from gw2_legendary_planner import (
     RECIPE_ENGINE_WARNINGS_FIELD,
     RECIPE_TREE_FIELD,
     RECIPE_UNKNOWN_STEPS_FIELD,
+    acquisition_options_for_entry,
+    build_action_plan_from_breakdown,
     build_rule_recommendations,
     build_target_breakdown,
     build_target_status,
+    format_action_plan,
+    format_acquisition_options_report,
     format_explain_missing_report,
     format_target_breakdown,
     make_recipe_engine_lines,
@@ -888,6 +892,86 @@ class RecipeEngineWikiFallbackTests(unittest.TestCase):
         self.assertIn("Source step: Gift of the Mists", recommendation_text)
         self.assertIn("Precursor step: Nyr Hrammr", recommendation_text)
 
+    def test_acquisition_options_for_multi_option_and_vendor_items(self) -> None:
+        clover_options = acquisition_options_for_entry(
+            {
+                "name": "Mystic Clover",
+                "category": "account-bound source step",
+                "data_confidence": "manual_review_needed",
+                "missing": 38,
+            }
+        )
+        runestone_options = acquisition_options_for_entry(
+            {
+                "name": "Mystic Runestone",
+                "category": "vendor item",
+                "data_confidence": "manual_review_needed",
+                "missing": 100,
+            }
+        )
+        bloodstone_options = acquisition_options_for_entry(
+            {
+                "name": "Bloodstone Shard",
+                "category": "vendor item",
+                "data_confidence": "manual_review_needed",
+                "missing": 1,
+            }
+        )
+
+        self.assertGreaterEqual(len(clover_options), 3)
+        self.assertEqual(
+            {option["source_type"] for option in clover_options},
+            {"currency_purchase", "weekly"},
+        )
+        self.assertEqual(runestone_options[0]["source_type"], "vendor")
+        self.assertIn("not verified", runestone_options[0]["notes"])
+        self.assertEqual(bloodstone_options[0]["currencies"], ["Spirit Shard"])
+
+    def test_action_plan_assigns_manual_review_and_farm_buckets(self) -> None:
+        breakdown = {
+            "target": {"name": "Klobjarne Geirr"},
+            "status": "Partially resolved",
+            "major_branches": [],
+            "terminal_missing_materials": [
+                {
+                    "id": 1,
+                    "name": "Charged Titan Ore",
+                    "needed": 500,
+                    "owned": 0,
+                    "missing": 500,
+                    "category": "normal material",
+                    "data_confidence": "official_api",
+                    "paths": [],
+                }
+            ],
+            "account_bound_manual_source_steps": [
+                {
+                    "id": 2,
+                    "item_id": 2,
+                    "name": "Unclear Collection Gift",
+                    "needed": 1,
+                    "owned": 0,
+                    "missing": 1,
+                    "category": "ambiguous/manual review",
+                    "data_confidence": "ambiguous",
+                    "paths": [],
+                }
+            ],
+            "warnings": ["Imported wiki data is ambiguous."],
+            "recommendations": [],
+        }
+
+        action_plan = build_action_plan_from_breakdown(breakdown)
+
+        self.assertEqual(
+            action_plan["buckets"]["farm_gather"][0]["name"],
+            "Charged Titan Ore",
+        )
+        self.assertEqual(
+            action_plan["buckets"]["manual_review"][0]["name"],
+            "Unclear Collection Gift",
+        )
+
     def test_klobjarne_style_breakdown_has_major_branches_and_source_steps(self) -> None:
         root_id = self.root_item_id
         nyr_id = 5000
@@ -1153,6 +1237,119 @@ class RecipeEngineWikiFallbackTests(unittest.TestCase):
             tree["satisfied_intermediates"][0]["paths"],
             ["Legendary Spear -> Gift of the Homesteader"],
         )
+
+    def test_klobjarne_style_action_plan_generation(self) -> None:
+        root_id = self.root_item_id
+        nyr_id = 8000
+        gift_id = 8001
+        runestone_id = 8002
+        clover_id = 8003
+        bloodstone_id = 8004
+        research_id = 8005
+
+        connection = self.reference_database.connect()
+        try:
+            insert_item(connection, nyr_id, "Nyr Hrammr")
+            insert_item(connection, gift_id, "Gift of Klobjarne Geirr", flags=["AccountBound"])
+            insert_item(connection, runestone_id, "Mystic Runestone", flags=["AccountBound"])
+            insert_item(connection, clover_id, "Mystic Clover")
+            insert_item(connection, bloodstone_id, "Bloodstone Shard", flags=["AccountBound"])
+            insert_item(connection, research_id, "Gift of Research", flags=["AccountBound"])
+            insert_wiki_recipe(
+                connection,
+                root_id,
+                self.root_item_name,
+                "\n".join(
+                    [
+                        "{{Recipe",
+                        "| source = Mystic Forge",
+                        "| ingredient1 = 1 Nyr Hrammr",
+                        "| ingredient2 = 1 Gift of Klobjarne Geirr",
+                        "| ingredient3 = 38 Mystic Clovers",
+                        "}}",
+                    ]
+                ),
+                source_url=self.source_url,
+            )
+            insert_wiki_recipe(
+                connection,
+                gift_id,
+                "Gift of Klobjarne Geirr",
+                "\n".join(
+                    [
+                        "{{Recipe",
+                        "| source = Mystic Forge",
+                        "| ingredient1 = 100 Mystic Runestone",
+                        "| ingredient2 = 1 Bloodstone Shard",
+                        "| ingredient3 = 1 Gift of Research",
+                        "}}",
+                    ]
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        self.write_overrides(
+            [
+                {
+                    "item_id": root_id,
+                    "name": self.root_item_name,
+                    "type": "mystic_forge",
+                    "verified": False,
+                    "ingredients": [],
+                }
+            ]
+        )
+
+        item_counts = {clover_id: 8, runestone_id: 10}
+        engine = self.make_engine()
+        tree = engine.resolve_recipe_tree(root_id, item_counts=item_counts)
+        target = {
+            "name": "Klobjarne Geirr",
+            "final_item_id": root_id,
+            "final_item_name": self.root_item_name,
+            "materials": [],
+            "currencies": [],
+            "steps": [],
+            AUTO_RECIPE_MATERIALS_FIELD: recipe_tree_to_material_entries(tree),
+            RECIPE_TREE_FIELD: tree,
+            RECIPE_UNKNOWN_STEPS_FIELD: tree["unknown_manual_steps"],
+            RECIPE_ENGINE_WARNINGS_FIELD: tree["warnings"],
+        }
+        breakdown = build_target_breakdown(
+            target,
+            wallet={},
+            item_counts=item_counts,
+            legendary_armory={},
+            item_names={},
+            currency_names={},
+        )
+        action_plan = build_action_plan_from_breakdown(breakdown)
+        text = format_action_plan(action_plan, show_paths=True)
+        options_text = format_acquisition_options_report(breakdown, "Mystic Clover")
+
+        self.assertTrue(
+            any(entry["name"] == "Nyr Hrammr" for entry in action_plan["buckets"]["priority_blockers"])
+        )
+        self.assertTrue(
+            any(entry["name"] == "Mystic Clover" for entry in action_plan["buckets"]["do_today"])
+        )
+        self.assertTrue(
+            any(entry["name"] == "Mystic Runestone" for entry in action_plan["buckets"]["buy_vendor"])
+        )
+        self.assertTrue(
+            any(entry["name"] == "Bloodstone Shard" for entry in action_plan["buckets"]["buy_vendor"])
+        )
+        self.assertTrue(
+            any(entry["name"] == "Gift of Research" for entry in action_plan["buckets"]["priority_blockers"])
+        )
+        self.assertIn("Priority blockers", text)
+        self.assertIn("Nyr Hrammr", text)
+        self.assertIn("Mystic Clover", text)
+        self.assertIn("Wizard's Vault", options_text)
+        self.assertIn("WvW reward tracks", options_text)
+        self.assertIn("weekly", options_text)
 
 
 if __name__ == "__main__":

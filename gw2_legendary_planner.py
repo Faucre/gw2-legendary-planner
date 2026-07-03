@@ -4539,6 +4539,507 @@ def build_explain_missing_report(
     return format_explain_missing_report(breakdown, item_name)
 
 
+def acquisition_option(
+    label: str,
+    source_type: str,
+    *,
+    source_url: str = "",
+    costs: list[dict[str, Any]] | None = None,
+    currencies: list[str] | None = None,
+    time_gate: str = "",
+    confidence: str = "manual_review_needed",
+    review_status: str = "manual_review_needed",
+    notes: str = "",
+) -> dict[str, Any]:
+    """Create one structured acquisition option for future CLI/GUI use."""
+
+    return {
+        "label": label,
+        "source_type": source_type,
+        "source_url": source_url,
+        "costs": costs or [],
+        "currencies": currencies or [],
+        "time_gate": time_gate,
+        "confidence": confidence,
+        "review_status": review_status,
+        "notes": notes,
+    }
+
+
+def acquisition_options_for_entry(entry: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return practical acquisition options for one missing requirement."""
+
+    name = str(entry.get("name", ""))
+    normalized_name = normalize_item_name(name)
+    category = str(entry.get("category", ""))
+    source_url = str(entry.get("source_url", ""))
+    confidence = str(entry.get("data_confidence", "manual_review_needed"))
+
+    if normalized_name == "mystic clover":
+        return [
+            acquisition_option(
+                "Wizard's Vault objectives and rewards",
+                "currency_purchase",
+                source_url=source_url,
+                time_gate="daily/weekly",
+                confidence=confidence,
+                notes="Use Astral Acclaim rewards when Mystic Clovers are available.",
+            ),
+            acquisition_option(
+                "WvW reward tracks",
+                "weekly",
+                source_url=source_url,
+                time_gate="repeatable",
+                confidence=confidence,
+                notes="Good low-planning source while also progressing Gift of Battle style goals.",
+            ),
+            acquisition_option(
+                "Weekly or limited vendors",
+                "weekly",
+                source_url=source_url,
+                time_gate="weekly",
+                confidence=confidence,
+                notes="Check current weekly vendor availability before committing currencies.",
+            ),
+        ]
+
+    if normalized_name == "mystic runestone":
+        return [
+            acquisition_option(
+                "Vendor/source purchase",
+                "vendor",
+                source_url=source_url,
+                confidence="manual_review_needed",
+                notes="Planner knows this is vendor/source-like, but exact cost is not verified here.",
+            )
+        ]
+
+    if normalized_name in {"bloodstone shard", "eldritch scroll"}:
+        return [
+            acquisition_option(
+                "Mystic Forge vendor",
+                "vendor",
+                source_url=source_url,
+                currencies=["Spirit Shard"],
+                confidence="manual_review_needed",
+                notes="Vendor-like Spirit Shard item; verify exact cost before spending.",
+            )
+        ]
+
+    if normalized_name == "hydrocatalytic reagent":
+        return [
+            acquisition_option(
+                "Vendor/source purchase",
+                "vendor",
+                source_url=source_url,
+                confidence="manual_review_needed",
+                notes="Cost/source should be verified before relying on this quantity.",
+            )
+        ]
+
+    janthir_words = (
+        "janthir",
+        "lowland",
+        "mursaat",
+        "honey flower",
+        "titan",
+        "homestead",
+        "charged titan ore",
+        "rotted titan amber",
+    )
+
+    if any(word in normalized_name for word in janthir_words):
+        return [
+            acquisition_option(
+                "Janthir map farming or map currency route",
+                "farm",
+                source_url=source_url,
+                confidence=confidence,
+                notes="Group this with other Janthir materials to reduce travel and context switching.",
+            )
+        ]
+
+    if category == "precursor":
+        return [
+            acquisition_option(
+                "Precursor acquisition",
+                "manual_review",
+                source_url=source_url,
+                confidence=confidence,
+                notes="Choose the precursor path before investing heavily in final assembly.",
+            )
+        ]
+
+    if category == "normal material":
+        return [
+            acquisition_option(
+                "Gather, craft, or buy",
+                "farm",
+                source_url=source_url,
+                confidence=confidence or "official_api",
+                notes="Use account stock first, then decide between gathering/crafting and Trading Post.",
+            ),
+            acquisition_option(
+                "Trading Post buy",
+                "trading_post",
+                source_url=source_url,
+                confidence="manual_review_needed",
+                notes="Price lookup is separate from this action-plan view.",
+            ),
+        ]
+
+    if category == "craftable component":
+        return [
+            acquisition_option(
+                "Craft from expanded child ingredients",
+                "craft",
+                source_url=source_url,
+                confidence=confidence,
+                notes="Follow the expanded component branch and stop if you already own the component.",
+            )
+        ]
+
+    if category == "achievement/collection step":
+        return [
+            acquisition_option(
+                "Achievement or collection",
+                "achievement",
+                source_url=source_url,
+                confidence="manual_review_needed",
+                notes="Planner should not guess achievement or collection details.",
+            )
+        ]
+
+    return [
+        acquisition_option(
+            "Manual source review",
+            "manual_review",
+            source_url=source_url,
+            confidence=confidence or "manual_review_needed",
+            review_status=str(entry.get("review_status", "manual_review_needed")),
+            notes="Review the source page or add a verified override before trusting this path.",
+        )
+    ]
+
+
+def entry_with_acquisition_options(entry: dict[str, Any]) -> dict[str, Any]:
+    """Copy one missing entry and attach structured acquisition options."""
+
+    return {
+        **entry,
+        "acquisition_options": acquisition_options_for_entry(entry),
+    }
+
+
+def action_bucket_name(entry: dict[str, Any]) -> str:
+    """Choose the main action-plan bucket for one missing entry."""
+
+    normalized_name = normalize_item_name(str(entry.get("name", "")))
+    category = str(entry.get("category", ""))
+    confidence = str(entry.get("data_confidence", ""))
+
+    if category == "precursor":
+        return "priority_blockers"
+
+    if "ambiguous" in confidence or "manual_review" in confidence and category == "ambiguous/manual review":
+        return "manual_review"
+
+    if normalized_name in {"mystic clover", "gift of battle"}:
+        return "do_today"
+
+    if category in {"account-bound source step", "achievement/collection step"}:
+        if normalized_name in {"gift of research", "gift of the mists"}:
+            return "priority_blockers"
+
+        return "manual_review"
+
+    if category == "vendor item":
+        return "buy_vendor"
+
+    if category == "craftable component":
+        return "crafting"
+
+    janthir_words = (
+        "janthir",
+        "lowland",
+        "mursaat",
+        "honey flower",
+        "titan",
+        "homestead",
+        "charged titan ore",
+        "rotted titan amber",
+    )
+
+    if any(word in normalized_name for word in janthir_words):
+        return "farm_gather"
+
+    if category == "normal material":
+        return "farm_gather"
+
+    return "manual_review"
+
+
+ACTION_BUCKET_TITLES = {
+    "priority_blockers": "Priority blockers",
+    "do_today": "Do today / do soon",
+    "buy_vendor": "Buy/vendor list",
+    "farm_gather": "Farm/gather list",
+    "crafting": "Crafting list",
+    "manual_review": "Manual review needed",
+}
+
+
+def build_action_plan_from_breakdown(breakdown: dict[str, Any]) -> dict[str, Any]:
+    """Convert a target breakdown into strategy buckets."""
+
+    buckets = {bucket_name: [] for bucket_name in ACTION_BUCKET_TITLES}
+
+    entries: list[dict[str, Any]] = []
+
+    for component in breakdown.get("major_branches", []):
+        if int(component.get("missing", 0)) > 0 and component.get("category") == "precursor":
+            entries.append(component)
+
+    entries.extend(breakdown.get("terminal_missing_materials", []))
+    entries.extend(breakdown.get("account_bound_manual_source_steps", []))
+
+    for entry in entries:
+        entry_with_options = entry_with_acquisition_options(entry)
+        buckets[action_bucket_name(entry_with_options)].append(entry_with_options)
+
+    warnings = list(breakdown.get("warnings", []))
+    suspicious_warnings = [
+        warning
+        for warning in warnings
+        if "duplicate ingredient" in warning.casefold()
+        or "manual review" in warning.casefold()
+        or "ambiguous" in warning.casefold()
+    ]
+
+    return {
+        "target": breakdown["target"],
+        "status": breakdown["status"],
+        "buckets": buckets,
+        "warnings": warnings,
+        "suspicious_warnings": suspicious_warnings,
+        "recommendations": list(breakdown.get("recommendations", [])),
+    }
+
+
+def format_action_plan_entry(
+    entry: dict[str, Any],
+    show_paths: bool = False,
+) -> list[str]:
+    """Format one action-plan entry."""
+
+    lines = [
+        f"  - {entry['name']}: {format_breakdown_entry_amount(entry)} "
+        f"[{entry.get('category', 'unknown')}; {entry.get('data_confidence', 'unknown')}]"
+    ]
+
+    options = list(entry.get("acquisition_options", []))
+
+    if options:
+        option_labels = ", ".join(option["label"] for option in options[:3])
+        lines.append(f"    Options: {option_labels}")
+
+        for option in options[:2]:
+            details = []
+
+            if option.get("time_gate"):
+                details.append(f"time gate: {option['time_gate']}")
+
+            if option.get("currencies"):
+                details.append(f"currencies: {', '.join(option['currencies'])}")
+
+            if option.get("costs"):
+                cost_text = ", ".join(str(cost) for cost in option["costs"])
+                details.append(f"costs: {cost_text}")
+
+            if option.get("confidence"):
+                details.append(f"confidence: {option['confidence']}")
+
+            if option.get("notes"):
+                details.append(option["notes"])
+
+            if details:
+                lines.append(f"    - {option['label']}: {'; '.join(details)}")
+
+    paths = [format_recipe_path(path) for path in entry.get("paths", []) if str(path).strip()]
+
+    if show_paths and paths:
+        lines.append("    Used in:")
+
+        for path in paths:
+            lines.append(f"      - {path}")
+    elif paths and important_path_entry(entry):
+        lines.append(f"    Used in: {paths[0]}")
+
+    return lines
+
+
+def format_action_plan(action_plan: dict[str, Any], show_paths: bool = False) -> str:
+    """Turn an action plan into readable CLI output."""
+
+    target = action_plan["target"]
+    lines = [
+        "Legendary Action Plan",
+        "=====================",
+        f"Target: {target['name']}",
+        f"Status: {action_plan['status']}",
+        "",
+    ]
+
+    for bucket_name, title in ACTION_BUCKET_TITLES.items():
+        entries = list(action_plan["buckets"].get(bucket_name, []))
+        lines.append(title)
+
+        if entries:
+            for entry in entries:
+                lines.extend(format_action_plan_entry(entry, show_paths=show_paths))
+        else:
+            lines.append("  - None right now.")
+
+        lines.append("")
+
+    if action_plan["suspicious_warnings"]:
+        lines.append("Trust / review flags")
+
+        for warning in action_plan["suspicious_warnings"][:8]:
+            lines.append(f"  - {warning}")
+
+        lines.append("")
+
+    lines.append("Recommended next actions")
+
+    if action_plan["recommendations"]:
+        for recommendation in action_plan["recommendations"][:6]:
+            lines.append(f"  - {recommendation}")
+    else:
+        lines.append("  - No ranked action found yet; start with priority blockers.")
+
+    return "\n".join(lines).rstrip()
+
+
+def build_action_plan_report(
+    targets: list[dict[str, Any]],
+    wallet: dict[int, int],
+    item_counts: dict[int, int],
+    legendary_armory: dict[int, int],
+    item_names: dict[int, str],
+    currency_names: dict[int, str],
+    target_name: str | None = None,
+    use_priority: bool = False,
+    show_paths: bool = False,
+) -> str:
+    """Build the focused CLI Action Plan v1 output."""
+
+    target = select_breakdown_target(
+        targets,
+        target_name=target_name,
+        use_priority=use_priority,
+    )
+    breakdown = build_target_breakdown(
+        target,
+        wallet,
+        item_counts,
+        legendary_armory,
+        item_names,
+        currency_names,
+        price_estimates=None,
+    )
+    return format_action_plan(
+        build_action_plan_from_breakdown(breakdown),
+        show_paths=show_paths,
+    )
+
+
+def format_acquisition_options_report(
+    breakdown: dict[str, Any],
+    item_name: str,
+) -> str:
+    """Show acquisition options for one missing entry."""
+
+    normalized_requested_name = normalize_item_name(item_name)
+    matches = [
+        entry
+        for _section, entry in breakdown_entries_for_explain(breakdown)
+        if normalize_item_name(str(entry.get("name", ""))) == normalized_requested_name
+    ]
+    lines = [
+        "Acquisition Options",
+        "===================",
+        f"Target: {breakdown['target']['name']}",
+        f"Requested item: {item_name}",
+    ]
+
+    if not matches:
+        lines.append("")
+        lines.append("No missing entry with that exact name was found in this breakdown.")
+        return "\n".join(lines).rstrip()
+
+    for entry in matches:
+        entry_with_options = entry_with_acquisition_options(entry)
+        lines.extend(
+            [
+                "",
+                f"Item: {entry_with_options['name']}",
+                f"Amount: {format_breakdown_entry_amount(entry_with_options)}",
+                f"Category: {entry_with_options.get('category', 'unknown')}",
+                f"Confidence: {entry_with_options.get('data_confidence', 'unknown')}",
+            ]
+        )
+
+        for option in entry_with_options["acquisition_options"]:
+            lines.append(f"  - {option['label']} [{option['source_type']}]")
+
+            if option.get("time_gate"):
+                lines.append(f"    Time gate: {option['time_gate']}")
+
+            if option.get("currencies"):
+                lines.append(f"    Currencies: {', '.join(option['currencies'])}")
+
+            if option.get("costs"):
+                lines.append(f"    Costs: {option['costs']}")
+            elif option["source_type"] in {"vendor", "currency_purchase"}:
+                lines.append("    Costs: unknown or unverified")
+
+            if option.get("source_url"):
+                lines.append(f"    Source URL: {option['source_url']}")
+
+            if option.get("notes"):
+                lines.append(f"    Notes: {option['notes']}")
+
+            lines.append(f"    Confidence: {option.get('confidence', 'manual_review_needed')}")
+
+    return "\n".join(lines).rstrip()
+
+
+def build_show_options_report(
+    targets: list[dict[str, Any]],
+    wallet: dict[int, int],
+    item_counts: dict[int, int],
+    legendary_armory: dict[int, int],
+    item_names: dict[int, str],
+    currency_names: dict[int, str],
+    target_name: str,
+    item_name: str,
+) -> str:
+    """Build the --show-options report."""
+
+    target = select_breakdown_target(targets, target_name=target_name)
+    breakdown = build_target_breakdown(
+        target,
+        wallet,
+        item_counts,
+        legendary_armory,
+        item_names,
+        currency_names,
+        price_estimates=None,
+    )
+    return format_acquisition_options_report(breakdown, item_name)
+
+
 def add_recommended_today_section(
     lines: list[str],
     targets: list[dict[str, Any]],
@@ -4838,6 +5339,22 @@ def parse_args() -> argparse.Namespace:
         help="Show a focused breakdown for the first enabled target in priority order.",
     )
     parser.add_argument(
+        "--action-plan",
+        default=None,
+        help="Show a practical acquisition action plan for one enabled target name.",
+    )
+    parser.add_argument(
+        "--action-plan-priority",
+        action="store_true",
+        help="Show an action plan for the first enabled target in priority order.",
+    )
+    parser.add_argument(
+        "--show-options",
+        nargs=2,
+        metavar=("TARGET", "ITEM"),
+        help="Show acquisition options for one missing item in one target.",
+    )
+    parser.add_argument(
         "--show-paths",
         action="store_true",
         help="Show full recipe paths in breakdown output.",
@@ -5113,6 +5630,52 @@ def main() -> int:
                 currency_names,
                 target_name,
                 missing_item_name,
+            )
+            print(report)
+
+            if args.output:
+                output_path = Path(args.output)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_text(report + "\n", encoding="utf-8")
+                print()
+                print(f"Report saved to {output_path}")
+
+            return 0
+
+        if args.show_options:
+            target_name, missing_item_name = args.show_options
+            report = build_show_options_report(
+                targets,
+                wallet,
+                item_counts,
+                legendary_armory,
+                item_names,
+                currency_names,
+                target_name,
+                missing_item_name,
+            )
+            print(report)
+
+            if args.output:
+                output_path = Path(args.output)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_text(report + "\n", encoding="utf-8")
+                print()
+                print(f"Report saved to {output_path}")
+
+            return 0
+
+        if args.action_plan or args.action_plan_priority:
+            report = build_action_plan_report(
+                targets,
+                wallet,
+                item_counts,
+                legendary_armory,
+                item_names,
+                currency_names,
+                target_name=args.action_plan,
+                use_priority=args.action_plan_priority,
+                show_paths=args.show_paths,
             )
             print(report)
 
