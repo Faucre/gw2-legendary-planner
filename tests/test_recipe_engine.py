@@ -375,6 +375,270 @@ class RecipeEngineWikiFallbackTests(unittest.TestCase):
         self.assertEqual(len(tree["unknown_manual_steps"]), 1)
         self.assertEqual(tree["unknown_manual_steps"][0]["item_id"], 4000)
 
+    def test_owned_full_intermediate_item_satisfies_branch(self) -> None:
+        connection = self.reference_database.connect()
+        try:
+            insert_item(connection, 3000, "Gift of the Homesteader", flags=["AccountBound"])
+            insert_item(connection, 3001, "Mystic Clover")
+            insert_wiki_recipe(
+                connection,
+                self.root_item_id,
+                self.root_item_name,
+                "\n".join(
+                    [
+                        "== Acquisition ==",
+                        "=== Recipe ===",
+                        "{{Recipe",
+                        "| source = Mystic Forge",
+                        "| ingredient1 = 1 Gift of the Homesteader",
+                        "}}",
+                    ]
+                ),
+                source_url=self.source_url,
+            )
+            insert_wiki_recipe(
+                connection,
+                3000,
+                "Gift of the Homesteader",
+                "\n".join(
+                    [
+                        "== Acquisition ==",
+                        "=== Recipe ===",
+                        "{{Recipe",
+                        "| source = Mystic Forge",
+                        "| ingredient1 = 38 Mystic Clovers",
+                        "}}",
+                    ]
+                ),
+                source_url="https://wiki.guildwars2.com/wiki/Gift_of_the_Homesteader",
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        self.write_overrides(
+            [
+                {
+                    "item_id": self.root_item_id,
+                    "name": self.root_item_name,
+                    "type": "mystic_forge",
+                    "verified": False,
+                    "ingredients": [],
+                }
+            ]
+        )
+
+        engine = self.make_engine()
+        tree = engine.resolve_recipe_tree(self.root_item_id, item_counts={3000: 1})
+
+        self.assertEqual(tree["raw_material_requirements"], [])
+        self.assertEqual(tree["unknown_manual_steps"], [])
+        self.assertEqual(tree["expanded_source_steps"], [])
+        self.assertEqual(tree["satisfied_intermediates"][0]["item_id"], 3000)
+        self.assertEqual(tree["satisfied_intermediates"][0]["amount"], 1)
+
+        target = {
+            RECIPE_TREE_FIELD: tree,
+            RECIPE_UNKNOWN_STEPS_FIELD: [],
+            RECIPE_ENGINE_WARNINGS_FIELD: [],
+            AUTO_RECIPE_MATERIALS_FIELD: recipe_tree_to_material_entries(tree),
+        }
+        report_lines = make_recipe_engine_lines(target)
+        self.assertTrue(
+            any("Gift of the Homesteader: have 1, branch satisfied." in line for line in report_lines)
+        )
+
+    def test_owned_partial_intermediate_stack_expands_only_remaining_amount(self) -> None:
+        connection = self.reference_database.connect()
+        try:
+            insert_item(connection, 3000, "Gift of the Homesteader", flags=["AccountBound"])
+            insert_item(connection, 3001, "Mystic Clover")
+            insert_wiki_recipe(
+                connection,
+                self.root_item_id,
+                self.root_item_name,
+                "\n".join(
+                    [
+                        "== Acquisition ==",
+                        "=== Recipe ===",
+                        "{{Recipe",
+                        "| source = Mystic Forge",
+                        "| ingredient1 = 2 Gift of the Homesteader",
+                        "}}",
+                    ]
+                ),
+                source_url=self.source_url,
+            )
+            insert_wiki_recipe(
+                connection,
+                3000,
+                "Gift of the Homesteader",
+                "\n".join(
+                    [
+                        "== Acquisition ==",
+                        "=== Recipe ===",
+                        "{{Recipe",
+                        "| source = Mystic Forge",
+                        "| ingredient1 = 38 Mystic Clovers",
+                        "}}",
+                    ]
+                ),
+                source_url="https://wiki.guildwars2.com/wiki/Gift_of_the_Homesteader",
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        self.write_overrides(
+            [
+                {
+                    "item_id": self.root_item_id,
+                    "name": self.root_item_name,
+                    "type": "mystic_forge",
+                    "verified": False,
+                    "ingredients": [],
+                }
+            ]
+        )
+
+        engine = self.make_engine()
+        tree = engine.resolve_recipe_tree(self.root_item_id, item_counts={3000: 1})
+
+        self.assertEqual(
+            {(row["item_id"], row["amount"]) for row in tree["raw_material_requirements"]},
+            {(3001, 38)},
+        )
+        self.assertEqual(tree["satisfied_intermediates"][0]["amount"], 1)
+        self.assertEqual(tree["satisfied_intermediates"][0]["remaining_amount"], 1)
+
+    def test_no_owned_intermediate_item_expands_full_branch(self) -> None:
+        connection = self.reference_database.connect()
+        try:
+            insert_item(connection, 3000, "Gift of the Homesteader", flags=["AccountBound"])
+            insert_item(connection, 3001, "Mystic Clover")
+            insert_wiki_recipe(
+                connection,
+                self.root_item_id,
+                self.root_item_name,
+                "\n".join(
+                    [
+                        "== Acquisition ==",
+                        "=== Recipe ===",
+                        "{{Recipe",
+                        "| source = Mystic Forge",
+                        "| ingredient1 = 2 Gift of the Homesteader",
+                        "}}",
+                    ]
+                ),
+                source_url=self.source_url,
+            )
+            insert_wiki_recipe(
+                connection,
+                3000,
+                "Gift of the Homesteader",
+                "\n".join(
+                    [
+                        "== Acquisition ==",
+                        "=== Recipe ===",
+                        "{{Recipe",
+                        "| source = Mystic Forge",
+                        "| ingredient1 = 38 Mystic Clovers",
+                        "}}",
+                    ]
+                ),
+                source_url="https://wiki.guildwars2.com/wiki/Gift_of_the_Homesteader",
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        self.write_overrides(
+            [
+                {
+                    "item_id": self.root_item_id,
+                    "name": self.root_item_name,
+                    "type": "mystic_forge",
+                    "verified": False,
+                    "ingredients": [],
+                }
+            ]
+        )
+
+        engine = self.make_engine()
+        tree = engine.resolve_recipe_tree(self.root_item_id, item_counts={})
+
+        self.assertEqual(
+            {(row["item_id"], row["amount"]) for row in tree["raw_material_requirements"]},
+            {(3001, 76)},
+        )
+        self.assertEqual(tree["satisfied_intermediates"], [])
+
+    def test_raw_material_mode_ignores_owned_intermediate_item(self) -> None:
+        connection = self.reference_database.connect()
+        try:
+            insert_item(connection, 3000, "Gift of the Homesteader", flags=["AccountBound"])
+            insert_item(connection, 3001, "Mystic Clover")
+            insert_wiki_recipe(
+                connection,
+                self.root_item_id,
+                self.root_item_name,
+                "\n".join(
+                    [
+                        "== Acquisition ==",
+                        "=== Recipe ===",
+                        "{{Recipe",
+                        "| source = Mystic Forge",
+                        "| ingredient1 = 1 Gift of the Homesteader",
+                        "}}",
+                    ]
+                ),
+                source_url=self.source_url,
+            )
+            insert_wiki_recipe(
+                connection,
+                3000,
+                "Gift of the Homesteader",
+                "\n".join(
+                    [
+                        "== Acquisition ==",
+                        "=== Recipe ===",
+                        "{{Recipe",
+                        "| source = Mystic Forge",
+                        "| ingredient1 = 38 Mystic Clovers",
+                        "}}",
+                    ]
+                ),
+                source_url="https://wiki.guildwars2.com/wiki/Gift_of_the_Homesteader",
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        self.write_overrides(
+            [
+                {
+                    "item_id": self.root_item_id,
+                    "name": self.root_item_name,
+                    "type": "mystic_forge",
+                    "verified": False,
+                    "ingredients": [],
+                }
+            ]
+        )
+
+        engine = self.make_engine()
+        tree = engine.resolve_recipe_tree(
+            self.root_item_id,
+            item_counts={3000: 1},
+            use_owned_intermediates=False,
+        )
+
+        self.assertEqual(
+            {(row["item_id"], row["amount"]) for row in tree["raw_material_requirements"]},
+            {(3001, 38)},
+        )
+        self.assertEqual(tree["satisfied_intermediates"], [])
+
     def test_manual_source_step_uses_imported_wiki_metadata(self) -> None:
         connection = self.reference_database.connect()
         try:
@@ -438,6 +702,11 @@ class RecipeEngineWikiFallbackTests(unittest.TestCase):
         self.assertTrue(any("Summary:" in line for line in report_lines))
         self.assertTrue(any("Source-step recipes expanded:" in line for line in report_lines))
         self.assertFalse(any("{{Recipe" in line for line in report_lines))
+
+        detailed_lines = make_recipe_engine_lines(target, detailed=True, debug=False)
+        debug_lines = make_recipe_engine_lines(target, detailed=True, debug=True)
+        self.assertFalse(any("Debug:" in line for line in detailed_lines))
+        self.assertTrue(any("Debug:" in line for line in debug_lines))
 
     def test_unparseable_source_step_recipe_shows_manual_review_message(self) -> None:
         connection = self.reference_database.connect()

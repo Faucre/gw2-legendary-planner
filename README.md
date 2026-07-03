@@ -61,6 +61,15 @@ To skip Trading Post price estimates:
 python gw2_legendary_planner.py --no-prices
 ```
 
+By default, the recipe planner uses owned intermediate items first. For example,
+if you already have a gift needed by a legendary, the app will not also count
+that gift's child ingredients. To ignore owned intermediates and fully expand
+recipes into raw requirements:
+
+```bash
+python gw2_legendary_planner.py --raw-materials
+```
+
 To rebuild the item name index:
 
 ```bash
@@ -305,6 +314,7 @@ Targets without `template` still work as fully manual targets:
 - Target status labels are `Complete`, `In progress`, `Partially resolved`, `Needs manual source data`, `Needs final item data`, or `Needs recipe data`.
 - Targets with TODO recipe/checklist steps but no material or currency data are marked `Needs recipe data`.
 - Normal output hides empty material/currency sections; use `--detailed` when you want to audit every section.
+- Default recipe planning uses owned intermediate items first; use `--raw-materials` when you want full base-material expansion.
 - Recipe templates live in `templates/`. If a template has TODO notes, verify the recipe before relying on exact quantities.
 - Template targets can add extra `steps`, `materials`, or `currencies` in `legendary_goals.json`.
 - Public item and official recipe API data is stored in `data/planner_reference.sqlite`.

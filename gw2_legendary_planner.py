@@ -1585,6 +1585,8 @@ def recipe_tree_to_material_entries(recipe_tree: dict[str, Any]) -> list[dict[st
 def resolve_target_recipe_data(
     targets: list[dict[str, Any]],
     recipe_engine: RecipeEngine | None = None,
+    item_counts: dict[int, int] | None = None,
+    use_owned_intermediates: bool = True,
 ) -> list[dict[str, Any]]:
     """Attach automatic recipe data and beginner-friendly warnings to targets."""
 
@@ -1618,7 +1620,11 @@ def resolve_target_recipe_data(
             resolved_targets.append(resolved_target)
             continue
 
-        recipe_tree = engine.resolve_recipe_tree(int(final_item_id))
+        recipe_tree = engine.resolve_recipe_tree(
+            int(final_item_id),
+            item_counts=item_counts,
+            use_owned_intermediates=use_owned_intermediates,
+        )
         resolved_target[RECIPE_TREE_FIELD] = recipe_tree
         resolved_target[AUTO_RECIPE_MATERIALS_FIELD] = recipe_tree_to_material_entries(
             recipe_tree
@@ -3286,7 +3292,11 @@ def make_step_lines(
     return lines
 
 
-def make_recipe_engine_lines(target: dict[str, Any], detailed: bool = False) -> list[str]:
+def make_recipe_engine_lines(
+    target: dict[str, Any],
+    detailed: bool = False,
+    debug: bool = False,
+) -> list[str]:
     """Build report lines for automatic recipe resolution."""
 
     recipe_tree = target.get(RECIPE_TREE_FIELD)
@@ -3294,6 +3304,9 @@ def make_recipe_engine_lines(target: dict[str, Any], detailed: bool = False) -> 
     manual_steps = list(target.get(RECIPE_UNKNOWN_STEPS_FIELD, []))
     auto_materials = list(target.get(AUTO_RECIPE_MATERIALS_FIELD, []))
     expanded_source_steps = list(recipe_tree.get("expanded_source_steps", [])) if recipe_tree else []
+    satisfied_intermediates = (
+        list(recipe_tree.get("satisfied_intermediates", [])) if recipe_tree else []
+    )
 
     if not recipe_tree and not warnings and not manual_steps:
         if detailed:
@@ -3358,7 +3371,24 @@ def make_recipe_engine_lines(target: dict[str, Any], detailed: bool = False) -> 
             if source_step.get("source_url"):
                 lines.append(f"        Source URL: {source_step['source_url']}")
 
-    if detailed and recipe_tree and recipe_tree.get("debug_events"):
+    if satisfied_intermediates:
+        lines.append("    Satisfied intermediate items:")
+        for intermediate in satisfied_intermediates:
+            used_amount = int(intermediate.get("amount", 0))
+            remaining_amount = int(intermediate.get("remaining_amount", 0))
+
+            if remaining_amount:
+                lines.append(
+                    f"      - {intermediate['name']}: have {used_amount:,}; "
+                    f"expanded remaining {remaining_amount:,}."
+                )
+            else:
+                lines.append(
+                    f"      - {intermediate['name']}: have {used_amount:,}, "
+                    "branch satisfied."
+                )
+
+    if debug and recipe_tree and recipe_tree.get("debug_events"):
         lines.append("    Debug:")
         for event in recipe_tree["debug_events"]:
             lines.append(f"      - {event}")
@@ -3793,6 +3823,7 @@ def build_report(
     """Create the final text report."""
 
     detailed = output_mode in {OUTPUT_MODE_DETAILED, OUTPUT_MODE_DEBUG}
+    debug = output_mode == OUTPUT_MODE_DEBUG
     character_cache_summary = next(
         (
             source.removeprefix("character inventories (").removesuffix(")")
@@ -3871,7 +3902,11 @@ def build_report(
             f"Target {target_number}: {target_name} [{target_status['status_label']}]"
         )
 
-        recipe_engine_lines = make_recipe_engine_lines(target, detailed=detailed)
+        recipe_engine_lines = make_recipe_engine_lines(
+            target,
+            detailed=detailed,
+            debug=debug,
+        )
 
         if recipe_engine_lines:
             lines.append("  Recipe engine:")
@@ -4032,6 +4067,14 @@ def parse_args() -> argparse.Namespace:
         help="Skip Trading Post price estimates.",
     )
     parser.add_argument(
+        "--raw-materials",
+        action="store_true",
+        help=(
+            "Fully expand recipe trees and ignore owned intermediate items. "
+            "Default mode uses owned intermediates first."
+        ),
+    )
+    parser.add_argument(
         "--rebuild-item-index",
         action="store_true",
         help="Force rebuilding item_name_index.json before resolving item names.",
@@ -4163,7 +4206,6 @@ def main() -> int:
             rebuild_item_index=args.rebuild_item_index,
         )
         recipe_engine = RecipeEngine()
-        targets = resolve_target_recipe_data(targets, recipe_engine)
 
         legendary_armory: dict[int, int] = {}
         armory_summary: dict[str, Any] = {
@@ -4194,6 +4236,13 @@ def main() -> int:
             token_permissions,
             DEFAULT_CHARACTER_INVENTORY_CACHE_PATH,
             refresh_character_inventories=args.refresh_character_inventories,
+        )
+
+        targets = resolve_target_recipe_data(
+            targets,
+            recipe_engine,
+            item_counts=item_counts,
+            use_owned_intermediates=not args.raw_materials,
         )
 
         item_ids, currency_ids = collect_goal_ids(targets)

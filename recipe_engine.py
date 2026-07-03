@@ -545,6 +545,10 @@ class RecipeEngine:
         self.craftable_ingredients: dict[int, dict[str, Any]] = {}
         self.manual_steps: dict[str, dict[str, Any]] = {}
         self.expanded_source_steps: dict[int, dict[str, Any]] = {}
+        self.satisfied_intermediates: dict[int, dict[str, Any]] = {}
+        self.owned_items_used: dict[int, int] = {}
+        self.account_item_counts: dict[int, int] = {}
+        self.use_owned_intermediates = True
         self.recipes_used: dict[int, dict[str, Any]] = {}
         self.resolution_log: dict[int, dict[str, Any]] = {}
         self.wiki_sources_used: dict[int, dict[str, Any]] = {}
@@ -1105,6 +1109,16 @@ class RecipeEngine:
         ingredients = override.get("ingredients", [])
 
         if ingredients:
+            remaining_amount = self.use_owned_intermediate(
+                item_id,
+                amount,
+                current_path,
+            )
+
+            if remaining_amount <= 0:
+                return
+
+            amount = remaining_amount
             output_count = max(int(override.get("output_count", 1)), 1)
             craft_count = math.ceil(amount / output_count)
 
@@ -1173,6 +1187,60 @@ class RecipeEngine:
         )
         entry["amount"] += amount
 
+    def use_owned_intermediate(
+        self,
+        item_id: int,
+        amount: int,
+        item_path: list[int],
+    ) -> int:
+        """Use owned intermediate items before expanding their child ingredients."""
+
+        if not self.use_owned_intermediates or not item_path[:-1]:
+            return amount
+
+        available = int(self.account_item_counts.get(item_id, 0)) - int(
+            self.owned_items_used.get(item_id, 0)
+        )
+
+        if available <= 0:
+            return amount
+
+        used_amount = min(int(amount), available)
+        remaining_amount = int(amount) - used_amount
+        self.owned_items_used[item_id] = self.owned_items_used.get(item_id, 0) + used_amount
+
+        entry = self.satisfied_intermediates.setdefault(
+            item_id,
+            {
+                "item_id": item_id,
+                "name": self.item_name(item_id),
+                "amount": 0,
+                "remaining_amount": 0,
+                "paths": [],
+            },
+        )
+        entry["amount"] += used_amount
+        entry["remaining_amount"] += remaining_amount
+
+        path_text = self.format_item_path(item_path)
+        if path_text and path_text not in entry["paths"]:
+            entry["paths"].append(path_text)
+
+        if remaining_amount <= 0:
+            self.record_resolution(
+                item_id,
+                "owned_intermediate_satisfied",
+                "Owned intermediate item was used, so this branch was not expanded.",
+                owned_amount=used_amount,
+            )
+        else:
+            self.debug_events.append(
+                f"Used owned intermediate: {self.item_name(item_id)} "
+                f"{used_amount:,}/{amount:,}; expanding remaining {remaining_amount:,}"
+            )
+
+        return remaining_amount
+
     def add_craftable_ingredient(
         self,
         item_id: int,
@@ -1213,6 +1281,16 @@ class RecipeEngine:
         item_name = self.item_name(item_id)
         resolved_ingredients = list(wiki_summary.get("resolved_ingredients", []))
         selection_reason = str(wiki_summary.get("reason", ""))
+        remaining_amount = self.use_owned_intermediate(
+            item_id,
+            amount,
+            current_path,
+        )
+
+        if remaining_amount <= 0:
+            return
+
+        amount = remaining_amount
 
         self.record_resolution(
             item_id,
@@ -1341,6 +1419,16 @@ class RecipeEngine:
         resolved_ingredients = list(wiki_summary.get("resolved_ingredients", []))
         ingredient_count = len(resolved_ingredients)
         selection_reason = str(wiki_summary.get("reason", ""))
+        remaining_amount = self.use_owned_intermediate(
+            item_id,
+            amount,
+            current_path,
+        )
+
+        if remaining_amount <= 0:
+            return
+
+        amount = remaining_amount
 
         self.add_expanded_source_step(item_id, amount, wiki_summary)
         self.record_resolution(
@@ -1863,6 +1951,16 @@ class RecipeEngine:
             self.record_resolution(item_id, "manual_recipe_gap", reason)
             return
 
+        remaining_amount = self.use_owned_intermediate(
+            item_id,
+            amount,
+            current_path,
+        )
+
+        if remaining_amount <= 0:
+            return
+
+        amount = remaining_amount
         output_count = max(int(recipe.get("output_item_count", 1)), 1)
         craft_count = math.ceil(amount / output_count)
         self.record_resolution(
@@ -1919,6 +2017,8 @@ class RecipeEngine:
         final_item_id: int,
         amount: int = 1,
         max_depth: int | None = None,
+        item_counts: dict[int, int] | None = None,
+        use_owned_intermediates: bool = True,
     ) -> dict[str, Any]:
         """Resolve a full recipe tree for one output item.
 
@@ -1931,6 +2031,13 @@ class RecipeEngine:
         self.craftable_ingredients = {}
         self.manual_steps = {}
         self.expanded_source_steps = {}
+        self.satisfied_intermediates = {}
+        self.owned_items_used = {}
+        self.account_item_counts = {
+            int(item_id): int(count)
+            for item_id, count in (item_counts or {}).items()
+        }
+        self.use_owned_intermediates = bool(use_owned_intermediates)
         self.recipes_used = {}
         self.resolution_log = {}
         self.wiki_sources_used = {}
@@ -1969,6 +2076,10 @@ class RecipeEngine:
             ),
             "expanded_source_steps": sorted(
                 self.expanded_source_steps.values(),
+                key=lambda entry: (entry["name"], entry["item_id"]),
+            ),
+            "satisfied_intermediates": sorted(
+                self.satisfied_intermediates.values(),
                 key=lambda entry: (entry["name"], entry["item_id"]),
             ),
             "recipes_used": sorted(
@@ -2021,6 +2132,8 @@ def resolve_recipe_tree(
     overrides_path: Path = DEFAULT_RECIPE_OVERRIDES_PATH,
     amount: int = 1,
     max_depth: int = DEFAULT_MAX_RECIPE_DEPTH,
+    item_counts: dict[int, int] | None = None,
+    use_owned_intermediates: bool = True,
 ) -> dict[str, Any]:
     """Convenience wrapper for resolving one recipe tree."""
 
@@ -2029,4 +2142,10 @@ def resolve_recipe_tree(
         overrides_path=overrides_path,
         max_depth=max_depth,
     )
-    return engine.resolve_recipe_tree(final_item_id, amount=amount, max_depth=max_depth)
+    return engine.resolve_recipe_tree(
+        final_item_id,
+        amount=amount,
+        max_depth=max_depth,
+        item_counts=item_counts,
+        use_owned_intermediates=use_owned_intermediates,
+    )
