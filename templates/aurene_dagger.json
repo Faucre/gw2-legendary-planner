@@ -1,6 +1,7 @@
 {
   "name": "Aurene Dagger",
-  "final_item_id": null,
+  "final_item_id": 96203,
+  "final_item_name": "Aurene's Claw",
   "recipe_status": "needs_verification",
   "steps": [
     {

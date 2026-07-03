@@ -1,6 +1,7 @@
 {
   "name": "Obsidian Armor set",
   "final_item_id": null,
+  "auto_resolve_final_item_from_name": false,
   "recipe_status": "needs_verification",
   "steps": [
     {

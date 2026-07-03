@@ -1,6 +1,7 @@
 {
   "name": "Aurene Pistol",
-  "final_item_id": null,
+  "final_item_id": 95808,
+  "final_item_name": "Aurene's Argument",
   "recipe_status": "needs_verification",
   "steps": [
     {

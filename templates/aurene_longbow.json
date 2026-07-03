@@ -1,6 +1,7 @@
 {
   "name": "Aurene Longbow",
-  "final_item_id": null,
+  "final_item_id": 97590,
+  "final_item_name": "Aurene's Flight",
   "recipe_status": "needs_verification",
   "steps": [
     {

@@ -8,4 +8,6 @@ item_cache.json
 item_name_index.json
 price_cache.json
 character_inventory_cache.json
+recipe_cache.json
+data/planner_reference.sqlite
 API_Key.env

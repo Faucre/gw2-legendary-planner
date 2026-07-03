@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "instructions": [
+    "Use this file for manual or special-case recipe data the official GW2 API cannot fully resolve.",
+    "final_item_id in a target is still the most explicit way to identify a legendary.",
+    "Overrides may use item_id or name. item_id is preferred because it cannot be ambiguous.",
+    "Supported types: manual, currency, achievement, collection, mystic_forge, vendor, time_gated, account_bound.",
+    "Add ingredients only after manually verifying them. Ingredients should use item_id when possible."
+  ],
+  "preferred_recipes_by_output": {},
+  "overrides": [
+    {
+      "item_id": 103815,
+      "name": "Klobjarne Geirr",
+      "type": "mystic_forge",
+      "verified": false,
+      "ingredients": [],
+      "notes": "Fill this with verified legendary recipe ingredients."
+    },
+    {
+      "item_id": 97590,
+      "name": "Aurene's Flight",
+      "type": "mystic_forge",
+      "verified": false,
+      "ingredients": [],
+      "notes": "Fill this with verified legendary recipe ingredients."
+    },
+    {
+      "item_id": 76158,
+      "name": "Astralaria",
+      "type": "mystic_forge",
+      "verified": false,
+      "ingredients": [],
+      "notes": "Fill this with verified legendary recipe ingredients."
+    },
+    {
+      "item_id": 96203,
+      "name": "Aurene's Claw",
+      "type": "mystic_forge",
+      "verified": false,
+      "ingredients": [],
+      "notes": "Fill this with verified legendary recipe ingredients."
+    },
+    {
+      "item_id": 81957,
+      "name": "The Shining Blade",
+      "type": "mystic_forge",
+      "verified": false,
+      "ingredients": [],
+      "notes": "Fill this with verified legendary recipe ingredients."
+    },
+    {
+      "item_id": 95808,
+      "name": "Aurene's Argument",
+      "type": "mystic_forge",
+      "verified": false,
+      "ingredients": [],
+      "notes": "Fill this with verified legendary recipe ingredients."
+    }
+  ]
+}

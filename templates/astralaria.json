@@ -1,6 +1,7 @@
 {
   "name": "Astralaria",
-  "final_item_id": null,
+  "final_item_id": 76158,
+  "final_item_name": "Astralaria",
   "recipe_status": "needs_verification",
   "steps": [
     {

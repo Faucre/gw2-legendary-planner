@@ -25,7 +25,7 @@ Requires Python 3.10 or newer.
 
 3. Edit `legendary_goals.json` with the materials and currencies you want to track.
 
-Materials can use either `item_id` or an exact `name`. If you use a name, the app looks it up with `/v2/items` and saves the result in `item_cache.json` so future runs do less API work.
+Materials can use either `item_id` or an exact `name`. If you use a name, the app prefers the local reference database and saves successful name resolutions in `item_cache.json`.
 
 The first name lookup may take a while because the app builds `item_name_index.json` from the public item API. After that file exists, future name lookups are local and much faster.
 
@@ -79,13 +79,130 @@ To save a report:
 python gw2_legendary_planner.py --output reports/missing-materials.txt
 ```
 
+To validate goals and templates without scanning your account inventory:
+
+```bash
+python gw2_legendary_planner.py --validate-goals
+```
+
+This checks `legendary_goals.json`, referenced templates, all template JSON files, final item resolution, name-only material entries, and whether recipe lookup appears possible for each enabled target. It does not require your GW2 API key and does not read wallet, bank, character, or inventory endpoints.
+
+To create empty override stubs for resolved targets that have no official crafting recipe:
+
+```bash
+python gw2_legendary_planner.py --generate-missing-overrides
+```
+
+This writes safe placeholders to `data/recipe_overrides.json` with `verified: false` and an empty `ingredients` list. It does not guess legendary recipe ingredients.
+
+To build or refresh the local public reference database:
+
+```bash
+python gw2_legendary_planner.py --setup-reference-db
+python gw2_legendary_planner.py --update-reference-db
+python gw2_legendary_planner.py --reference-db-status
+```
+
+Normal planner runs use `data/planner_reference.sqlite` when it exists. Setup/update commands fetch public item and recipe data, build lookup tables, apply `data/recipe_overrides.json`, then import targeted wiki data only for configured targets that still have no official recipe or verified override ingredients. Account-specific caches stay separate.
+
 The report includes a `Recommended today` section. It looks at the first incomplete enabled target first, separates gameplay recommendations from configuration/TODO recommendations, then gives shorter secondary notes for later targets.
+
+## Recipe Engine
+
+The app includes a conservative recipe engine in `recipe_engine.py`.
+
+When a target has a verified `final_item_id`, normal runs ask the local reference database which recipes output that item. The setup/update commands populate that database from the official Guild Wars 2 API:
+
+- `/v2/recipes/search?output=<item_id>`
+- `/v2/recipes?ids=...`
+
+If `final_item_id` is missing but `final_item_name` is present, the app resolves that name through the existing item lookup cache. If both are missing, the app tries the target's `name` as a fallback final item name unless `auto_resolve_final_item_from_name` is set to `false`. The name must match exactly one item. Missing, ambiguous, or misspelled final item names become warnings instead of silent guesses.
+
+The engine recursively follows craftable ingredients and adds terminal raw/material requirements to the target automatically. Official recipe and item data belongs in `data/planner_reference.sqlite`; `recipe_cache.json` is legacy fallback cache data.
+
+The recipe engine does not use your account API key. It only reads public API data.
+
+Wiki imports are stored as source material, not trusted recipe totals. Imported wiki rows and acquisition options are marked `wiki_imported_unreviewed` until you manually verify them and copy verified ingredients into `data/recipe_overrides.json`.
+
+Automatic resolution stops and adds a warning instead of guessing when:
+
+- no recipe exists for the final target item
+- multiple recipes exist and no preferred recipe is configured
+- an item is configured as manual
+- an item appears account-bound or soulbound
+- an override says the item comes from currency, achievements, collections, Mystic Forge, vendors, or time gates
+- a recipe cycle is detected
+- the max recipe depth is reached
+- the public API cannot return the needed recipe data
+
+Use `data/recipe_overrides.json` for curated choices that the official API cannot decide safely:
+
+```json
+{
+  "preferred_recipes_by_output": {
+    "12345": 67890
+  },
+  "overrides": [
+    {
+      "item_id": 24680,
+      "name": "Example Account-Bound Item",
+      "type": "account_bound",
+      "source_hint": "Earned through an achievement or collection.",
+      "notes": "Track this manually instead of using Trading Post pricing."
+    },
+    {
+      "name": "Example Mystic Forge Gift",
+      "type": "mystic_forge",
+      "source_hint": "Mystic Forge recipe verified manually.",
+      "ingredients": [
+        {
+          "item_id": 19721,
+          "name": "Glob of Ectoplasm",
+          "amount": 250
+        }
+      ]
+    }
+  ]
+}
+```
+
+Do not use override data to guess legendary requirements. Add curated entries only after verifying them. `item_id` is preferred over `name` in overrides because names can be ambiguous.
 
 ## Config Format
 
-Each target can have `materials`, `currencies`, manual `steps`, and an optional `final_item_id`.
+Each target can have `materials`, `currencies`, manual `steps`, and an optional `final_item_id` or `final_item_name`.
 
 Use `final_item_id` for the finished legendary item. If that item is already in your Legendary Armory, the app marks the target as complete.
+
+`final_item_id` is the most explicit option. `final_item_name` is supported when you prefer readable config:
+
+```json
+{
+  "targets": [
+    {
+      "name": "Aurene Longbow",
+      "enabled": true,
+      "final_item_name": "Aurene's Flight"
+    }
+  ]
+}
+```
+
+When `final_item_id` is present, `final_item_name` resolves to one exact item, or the target `name` resolves cleanly as a fallback, the recipe engine will try to resolve craftable requirements automatically. Any handwritten `materials`, `currencies`, or `steps` on the target are still kept and are added alongside API-resolved material data.
+
+For targets that are intentionally not one final item, such as armor sets or rune/sigil sets, disable fallback lookup:
+
+```json
+{
+  "targets": [
+    {
+      "name": "Obsidian Armor set",
+      "enabled": true,
+      "auto_resolve_final_item_from_name": false
+    }
+  ]
+}
+```
 
 Use `steps` for manual checklist items that are not API materials or wallet currencies.
 
@@ -174,6 +291,11 @@ Targets without `template` still work as fully manual targets:
 - Normal output hides empty material/currency sections; use `--detailed` when you want to audit every section.
 - Recipe templates live in `templates/`. If a template has TODO notes, verify the recipe before relying on exact quantities.
 - Template targets can add extra `steps`, `materials`, or `currencies` in `legendary_goals.json`.
+- Public item and official recipe API data is stored in `data/planner_reference.sqlite`.
+- `recipe_cache.json` is legacy fallback cache data.
+- Resolved item names, including `final_item_name`, are cached in `item_cache.json`.
+- Curated recipe choices and manual stops live in `data/recipe_overrides.json`.
+- Recipe engine warnings mean the app refused to guess. Verify the item, add a preferred recipe, or add an override entry.
 - Manual `steps` are shown in the report but are not counted as item IDs or wallet currencies.
 - Completed manual steps are shown only when you run with `--show-complete`.
 - Optional `source_hint` text is shown under missing materials or currencies.

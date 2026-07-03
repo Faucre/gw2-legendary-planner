@@ -22,6 +22,16 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
+from recipe_engine import RecipeApiError, RecipeEngine
+from reference_database import (
+    DEFAULT_REFERENCE_DB_PATH,
+    ReferenceApiError,
+    ReferenceDatabase,
+    WikiImportError,
+    reference_database_status,
+    setup_reference_database,
+)
+
 
 # Official Guild Wars 2 API base URL.
 API_BASE_URL = "https://api.guildwars2.com/v2"
@@ -73,6 +83,12 @@ REQUIRED_PERMISSIONS = ("wallet", "inventories", "characters", "unlocks")
 OUTPUT_MODE_SUMMARY = "summary"
 OUTPUT_MODE_DETAILED = "detailed"
 OUTPUT_MODE_DEBUG = "debug"
+
+# Target keys filled by the automatic recipe engine.
+AUTO_RECIPE_MATERIALS_FIELD = "auto_recipe_materials"
+RECIPE_TREE_FIELD = "recipe_tree"
+RECIPE_ENGINE_WARNINGS_FIELD = "recipe_engine_warnings"
+RECIPE_UNKNOWN_STEPS_FIELD = "recipe_unknown_manual_steps"
 
 # This is set from --debug in main(). It keeps normal runs quiet while still
 # making troubleshooting information easy to turn on.
@@ -624,6 +640,31 @@ def fetch_names(path: str, id_values: set[int]) -> dict[int, str]:
             names[row["id"]] = row.get("name", f"ID {row['id']}")
 
     return names
+
+
+def reference_database_if_available() -> ReferenceDatabase | None:
+    """Return the local reference database when it exists."""
+
+    reference_database = ReferenceDatabase(DEFAULT_REFERENCE_DB_PATH)
+
+    if reference_database.exists():
+        return reference_database
+
+    return None
+
+
+def fetch_item_names_from_reference(id_values: set[int]) -> dict[int, str]:
+    """Fetch item names from the local reference database."""
+
+    reference_database = reference_database_if_available()
+
+    if not reference_database or not id_values:
+        return {}
+
+    return {
+        item_id: item.get("name", f"Item {item_id}")
+        for item_id, item in reference_database.items_by_id(list(id_values)).items()
+    }
 
 
 def format_coin(copper: int) -> str:
@@ -1204,6 +1245,7 @@ def resolve_goal_material_names(
     """Fill in item_id for materials that were written with name only."""
 
     cache = load_item_cache(cache_path)
+    reference_database = reference_database_if_available()
     names_to_lookup: set[str] = set()
 
     for target in targets:
@@ -1221,6 +1263,9 @@ def resolve_goal_material_names(
                 )
 
             if not get_cached_item(cache, material_name):
+                if reference_database:
+                    continue
+
                 names_to_lookup.add(material_name)
 
     if names_to_lookup:
@@ -1247,14 +1292,39 @@ def resolve_goal_material_names(
                 material_name = str(resolved_material["name"])
                 cached_item = get_cached_item(cache, material_name)
 
-                if not cached_item:
+                if cached_item:
+                    resolved_material["item_id"] = int(cached_item["item_id"])
+                    resolved_material["name"] = cached_item.get("name", material_name)
+                elif reference_database:
+                    matches = reference_database.item_name_matches(material_name)
+
+                    if not matches:
+                        raise ItemLookupError(
+                            f"Could not find material '{material_name}' in "
+                            f"{DEFAULT_REFERENCE_DB_PATH}. Check the spelling, use item_id, "
+                            "or run --setup-reference-db."
+                        )
+
+                    if len(matches) > 1:
+                        match_text = ", ".join(
+                            f"{match.get('name', 'Unknown name')} (item_id {match['id']})"
+                            for match in matches[:10]
+                        )
+                        raise ItemLookupError(
+                            f"More than one item is named '{material_name}'. "
+                            f"Please use item_id for that material. Matches: {match_text}"
+                        )
+
+                    matched_item = matches[0]
+                    cache_item_lookup(cache, material_name, matched_item)
+                    save_item_cache(cache_path, cache)
+                    resolved_material["item_id"] = int(matched_item["item_id"])
+                    resolved_material["name"] = matched_item.get("name", material_name)
+                else:
                     raise ItemLookupError(
                         f"Could not resolve '{material_name}'. Try running again, "
                         "or use item_id for that material."
                     )
-
-                resolved_material["item_id"] = int(cached_item["item_id"])
-                resolved_material["name"] = cached_item.get("name", material_name)
 
             resolved_materials.append(resolved_material)
 
@@ -1262,6 +1332,1009 @@ def resolve_goal_material_names(
         resolved_targets.append(resolved_target)
 
     return resolved_targets
+
+
+def add_target_recipe_warning(target: dict[str, Any], warning: str) -> None:
+    """Attach a recipe/final-item warning to a target without duplicates."""
+
+    warnings = target.setdefault(RECIPE_ENGINE_WARNINGS_FIELD, [])
+
+    if warning not in warnings:
+        warnings.append(warning)
+
+
+def target_final_item_lookup_name(target: dict[str, Any]) -> tuple[str, str]:
+    """Return the name to resolve for a target and where it came from."""
+
+    final_item_name = str(target.get("final_item_name", "")).strip()
+
+    if final_item_name:
+        return final_item_name, "final_item_name"
+
+    if target.get("auto_resolve_final_item_from_name", True) is False:
+        return "", ""
+
+    target_name = str(target.get("name", "")).strip()
+
+    if target_name:
+        return target_name, "target name"
+
+    return "", ""
+
+
+def resolve_target_final_item_names(
+    targets: list[dict[str, Any]],
+    cache_path: Path,
+    index_path: Path,
+    rebuild_item_index: bool = False,
+) -> list[dict[str, Any]]:
+    """Resolve final_item_name or target name to final_item_id."""
+
+    cache = load_item_cache(cache_path)
+    reference_database = reference_database_if_available()
+    names_to_lookup: set[str] = set()
+
+    for target in targets:
+        if target.get("final_item_id") is not None:
+            continue
+
+        lookup_name, _lookup_source = target_final_item_lookup_name(target)
+
+        if lookup_name and not get_cached_item(cache, lookup_name):
+            if reference_database:
+                continue
+
+            names_to_lookup.add(lookup_name)
+
+    index: dict[str, Any] | None = None
+
+    if names_to_lookup:
+        try:
+            index = ensure_item_name_index(index_path, rebuild=rebuild_item_index)
+        except ItemLookupError as error:
+            index = None
+            lookup_warning = (
+                "Automatic final item lookup could not use the item name index. "
+                f"Details: {error}"
+            )
+
+            for target in targets:
+                lookup_name, _lookup_source = target_final_item_lookup_name(target)
+
+                if target.get("final_item_id") is None and lookup_name:
+                    add_target_recipe_warning(target, lookup_warning)
+
+    resolved_targets: list[dict[str, Any]] = []
+
+    for target in targets:
+        resolved_target = dict(target)
+
+        if target.get(RECIPE_ENGINE_WARNINGS_FIELD):
+            resolved_target[RECIPE_ENGINE_WARNINGS_FIELD] = list(
+                target.get(RECIPE_ENGINE_WARNINGS_FIELD, [])
+            )
+
+        if resolved_target.get("final_item_id") is not None:
+            resolved_targets.append(resolved_target)
+            continue
+
+        lookup_name, lookup_source = target_final_item_lookup_name(resolved_target)
+
+        if not lookup_name:
+            resolved_targets.append(resolved_target)
+            continue
+
+        cached_item = get_cached_item(cache, lookup_name)
+
+        if cached_item:
+            resolved_target["final_item_id"] = int(cached_item["item_id"])
+            resolved_target["final_item_name"] = cached_item.get("name", lookup_name)
+            resolved_targets.append(resolved_target)
+            continue
+
+        if reference_database:
+            matches = reference_database.item_name_matches(lookup_name)
+
+            if not matches:
+                if lookup_source == "target name":
+                    warning = (
+                        f"Could not resolve target name '{lookup_name}' as a final item "
+                        f"in {DEFAULT_REFERENCE_DB_PATH}. Add final_item_name or "
+                        "final_item_id, or set auto_resolve_final_item_from_name to "
+                        "false for this target."
+                    )
+                else:
+                    warning = (
+                        f"Could not find a final item named '{lookup_name}' in "
+                        f"{DEFAULT_REFERENCE_DB_PATH}. Check the spelling, or use "
+                        "final_item_id."
+                    )
+
+                add_target_recipe_warning(resolved_target, warning)
+                resolved_targets.append(resolved_target)
+                continue
+
+            if len(matches) > 1:
+                match_text = ", ".join(
+                    f"{match.get('name', 'Unknown name')} (item_id {match['id']})"
+                    for match in matches[:10]
+                )
+                if lookup_source == "target name":
+                    warning = (
+                        f"Target name '{lookup_name}' matches more than one final item "
+                        f"in {DEFAULT_REFERENCE_DB_PATH}. Add final_item_name or "
+                        f"final_item_id. Matches: {match_text}"
+                    )
+                else:
+                    warning = (
+                        f"More than one final item is named '{lookup_name}' in "
+                        f"{DEFAULT_REFERENCE_DB_PATH}. Use final_item_id. "
+                        f"Matches: {match_text}"
+                    )
+
+                add_target_recipe_warning(resolved_target, warning)
+                resolved_targets.append(resolved_target)
+                continue
+
+            matched_item = matches[0]
+            cache_item_lookup(cache, lookup_name, matched_item)
+            save_item_cache(cache_path, cache)
+            resolved_target["final_item_id"] = int(matched_item["item_id"])
+            resolved_target["final_item_name"] = matched_item.get("name", lookup_name)
+            resolved_targets.append(resolved_target)
+            continue
+
+        if index is None:
+            resolved_targets.append(resolved_target)
+            continue
+
+        matches = index["items_by_name"].get(normalize_item_name(lookup_name), [])
+
+        if not matches:
+            if lookup_source == "target name":
+                warning = (
+                    f"Could not resolve target name '{lookup_name}' as a final item. "
+                    "Add final_item_name or final_item_id, or set "
+                    "auto_resolve_final_item_from_name to false for this target."
+                )
+            else:
+                warning = (
+                    f"Could not find a final item named '{lookup_name}'. "
+                    "Check the spelling, or use final_item_id."
+                )
+
+            add_target_recipe_warning(
+                resolved_target,
+                warning,
+            )
+            resolved_targets.append(resolved_target)
+            continue
+
+        if len(matches) > 1:
+            match_text = ", ".join(
+                f"{match.get('name', 'Unknown name')} (item_id {match['id']})"
+                for match in matches[:10]
+            )
+            if lookup_source == "target name":
+                warning = (
+                    f"Target name '{lookup_name}' matches more than one final item. "
+                    f"Add final_item_name or final_item_id. Matches: {match_text}"
+                )
+            else:
+                warning = (
+                    f"More than one final item is named '{lookup_name}'. "
+                    f"Use final_item_id. Matches: {match_text}"
+                )
+
+            add_target_recipe_warning(
+                resolved_target,
+                warning,
+            )
+            resolved_targets.append(resolved_target)
+            continue
+
+        matched_item = matches[0]
+        cache_item_lookup(cache, lookup_name, matched_item)
+        save_item_cache(cache_path, cache)
+        resolved_target["final_item_id"] = int(matched_item["item_id"])
+        resolved_target["final_item_name"] = matched_item.get("name", lookup_name)
+        debug_print(
+            f"Resolved {lookup_source} {lookup_name} to "
+            f"item_id {matched_item['item_id']}."
+        )
+        resolved_targets.append(resolved_target)
+
+    return resolved_targets
+
+
+def target_materials(target: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return manual materials plus automatic recipe-engine materials."""
+
+    return list(target.get("materials", [])) + list(
+        target.get(AUTO_RECIPE_MATERIALS_FIELD, [])
+    )
+
+
+def recipe_tree_to_material_entries(recipe_tree: dict[str, Any]) -> list[dict[str, Any]]:
+    """Convert recipe-engine terminal materials into normal goal entries."""
+
+    material_entries: list[dict[str, Any]] = []
+
+    for material in recipe_tree.get("raw_material_requirements", []):
+        material_entries.append(
+            {
+                "item_id": int(material["item_id"]),
+                "name": material.get("name", f"Item {material['item_id']}"),
+                "amount": int(material["amount"]),
+                "source_hint": "Auto-resolved from the official GW2 recipe API.",
+            }
+        )
+
+    return material_entries
+
+
+def resolve_target_recipe_data(
+    targets: list[dict[str, Any]],
+    recipe_engine: RecipeEngine | None = None,
+) -> list[dict[str, Any]]:
+    """Attach automatic recipe data and beginner-friendly warnings to targets."""
+
+    engine = recipe_engine or RecipeEngine()
+    resolved_targets: list[dict[str, Any]] = []
+
+    for target in targets:
+        resolved_target = dict(target)
+        existing_warnings = list(resolved_target.get(RECIPE_ENGINE_WARNINGS_FIELD, []))
+        resolved_target[AUTO_RECIPE_MATERIALS_FIELD] = []
+        resolved_target[RECIPE_ENGINE_WARNINGS_FIELD] = existing_warnings
+        resolved_target.setdefault(RECIPE_UNKNOWN_STEPS_FIELD, [])
+
+        final_item_id = resolved_target.get("final_item_id")
+
+        if final_item_id is None:
+            has_manual_tracking = bool(
+                resolved_target.get("materials")
+                or resolved_target.get("currencies")
+                or resolved_target.get("steps")
+            )
+
+            if target_recipe_status_needs_work(resolved_target) or not has_manual_tracking:
+                add_target_recipe_warning(
+                    resolved_target,
+                    "Automatic recipe lookup skipped because final_item_id is not set. "
+                    "Add final_item_id or a resolvable final_item_name before relying "
+                    "on API recipe data.",
+                )
+
+            resolved_targets.append(resolved_target)
+            continue
+
+        recipe_tree = engine.resolve_recipe_tree(int(final_item_id))
+        resolved_target[RECIPE_TREE_FIELD] = recipe_tree
+        resolved_target[AUTO_RECIPE_MATERIALS_FIELD] = recipe_tree_to_material_entries(
+            recipe_tree
+        )
+        resolved_target[RECIPE_ENGINE_WARNINGS_FIELD] = existing_warnings + [
+            warning
+            for warning in recipe_tree.get("warnings", [])
+            if warning not in existing_warnings
+        ]
+        resolved_target[RECIPE_UNKNOWN_STEPS_FIELD] = list(
+            recipe_tree.get("unknown_manual_steps", [])
+        )
+        resolved_targets.append(resolved_target)
+
+    return resolved_targets
+
+
+def validate_template_files(templates_dir: Path) -> int:
+    """Validate every JSON template file and return how many were checked."""
+
+    template_paths = sorted(templates_dir.glob("*.json"))
+
+    for template_path in template_paths:
+        load_template(template_path.stem, templates_dir)
+
+    return len(template_paths)
+
+
+def validation_item_lookup(
+    item_name: str,
+    cache: dict[str, Any],
+    cache_path: Path,
+    index: dict[str, Any] | None,
+    label: str,
+    reference_database: ReferenceDatabase | None = None,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Resolve one item name for validation without guessing."""
+
+    warnings: list[str] = []
+    clean_item_name = item_name.strip()
+
+    if not clean_item_name:
+        return None, [f"{label} is missing a name."]
+
+    cached_item = get_cached_item(cache, clean_item_name)
+
+    if cached_item:
+        return cached_item, warnings
+
+    if reference_database:
+        matches = reference_database.item_name_matches(clean_item_name)
+
+        if not matches:
+            return None, [
+                f"{label} '{clean_item_name}' was not found in "
+                f"{DEFAULT_REFERENCE_DB_PATH}."
+            ]
+
+        if len(matches) > 1:
+            match_text = ", ".join(
+                f"{match.get('name', 'Unknown name')} (item_id {match['id']})"
+                for match in matches[:10]
+            )
+            return None, [
+                f"{label} '{clean_item_name}' is ambiguous. Use item_id. "
+                f"Matches: {match_text}"
+            ]
+
+        matched_item = matches[0]
+        cache_item_lookup(cache, clean_item_name, matched_item)
+        save_item_cache(cache_path, cache)
+        return matched_item, warnings
+
+    if index is None:
+        return None, [
+            f"{label} '{clean_item_name}' could not be checked because "
+            "item_name_index.json is not available."
+        ]
+
+    matches = index["items_by_name"].get(normalize_item_name(clean_item_name), [])
+
+    if not matches:
+        return None, [f"{label} '{clean_item_name}' was not found in the GW2 item index."]
+
+    if len(matches) > 1:
+        match_text = ", ".join(
+            f"{match.get('name', 'Unknown name')} (item_id {match['id']})"
+            for match in matches[:10]
+        )
+        return None, [
+            f"{label} '{clean_item_name}' is ambiguous. Use item_id. "
+            f"Matches: {match_text}"
+        ]
+
+    matched_item = matches[0]
+    cache_item_lookup(cache, clean_item_name, matched_item)
+    save_item_cache(cache_path, cache)
+    return matched_item, warnings
+
+
+def validate_recipe_lookup(
+    recipe_engine: RecipeEngine,
+    final_item_id: int | None,
+    final_item_name: str,
+) -> tuple[str, list[str]]:
+    """Check whether a final item can be resolved through recipes or overrides."""
+
+    if final_item_id is None:
+        return "no (no final item resolved)", []
+
+    override = recipe_engine.override_for_item(final_item_id, final_item_name)
+
+    if override:
+        override_type = override.get("type", "manual")
+
+        if override.get("ingredients"):
+            return f"yes (verified {override_type} override ingredients)", []
+
+        return f"manual ({override_type} override)", []
+
+    try:
+        recipe_ids = recipe_engine.recipe_ids_for_output(final_item_id)
+    except RecipeApiError as error:
+        return "unknown (recipe API lookup failed)", [f"Recipe lookup failed: {error}"]
+
+    if not recipe_ids:
+        return "Needs legendary override data", [
+            "No official crafting recipe found; this may be expected for "
+            "Mystic Forge or legendary items."
+        ]
+
+    if len(recipe_ids) == 1:
+        return f"yes (official recipe {recipe_ids[0]})", []
+
+    preferred_recipe_id = recipe_engine.preferred_recipes_by_output.get(final_item_id)
+
+    if preferred_recipe_id in recipe_ids:
+        return (
+            f"yes (preferred recipe {preferred_recipe_id} from "
+            f"{len(recipe_ids)} official recipes)",
+            [],
+        )
+
+    recipe_text = ", ".join(str(recipe_id) for recipe_id in recipe_ids)
+    return (
+        "no (multiple recipes need a preferred override)",
+        [
+            "Multiple official recipes output this item. Add a preferred recipe "
+            f"in data/recipe_overrides.json. Recipe IDs: {recipe_text}"
+        ],
+    )
+
+
+def build_validate_goals_report(
+    config_path: Path,
+    rebuild_item_index: bool = False,
+) -> str:
+    """Build a fast validation report for goals and templates."""
+
+    template_count = validate_template_files(DEFAULT_TEMPLATES_DIR)
+    targets = load_goals(config_path)
+    cache = load_item_cache(DEFAULT_ITEM_CACHE_PATH)
+    reference_database = reference_database_if_available()
+    names_to_check: set[str] = set()
+
+    for target in targets:
+        if target.get("final_item_id") is None:
+            lookup_name, _lookup_source = target_final_item_lookup_name(target)
+
+            if lookup_name and not get_cached_item(cache, lookup_name):
+                if reference_database:
+                    continue
+
+                names_to_check.add(lookup_name)
+
+        for material in target.get("materials", []):
+            if material_has_item_id(material):
+                continue
+
+            material_name = str(material.get("name", "")).strip()
+
+            if material_name and not get_cached_item(cache, material_name):
+                if reference_database:
+                    continue
+
+                names_to_check.add(material_name)
+
+    index: dict[str, Any] | None = None
+    index_warning = ""
+
+    if names_to_check:
+        try:
+            index = ensure_item_name_index(
+                DEFAULT_ITEM_NAME_INDEX_PATH,
+                rebuild=rebuild_item_index,
+            )
+        except ItemLookupError as error:
+            index_warning = (
+                "Item name index could not be loaded or built. "
+                f"Name checks may be incomplete. Details: {error}"
+            )
+
+    recipe_engine = RecipeEngine()
+    lines = [
+        "Guild Wars 2 Legendary Planner Goal Validation",
+        "================================================",
+        f"Config: {config_path}",
+        f"Template files checked: {template_count:,}",
+        f"Enabled targets: {len(targets):,}",
+    ]
+
+    if index_warning:
+        lines.append(f"Warning: {index_warning}")
+
+    lines.append("")
+
+    if not targets:
+        lines.append("No enabled targets found.")
+        return "\n".join(lines)
+
+    total_warnings = 0
+
+    for target_number, target in enumerate(targets, start=1):
+        target_name = str(target.get("name", "Unnamed target"))
+        final_item_id = target_final_item_id(target)
+        configured_final_item_name = str(target.get("final_item_name", "")).strip()
+        lookup_name, lookup_source = target_final_item_lookup_name(target)
+        target_warnings: list[str] = []
+        resolved_final_item_name = configured_final_item_name
+        final_resolution = "no final item configured"
+
+        if final_item_id is not None:
+            final_resolution = "yes (explicit final_item_id)"
+        elif lookup_name:
+            label = (
+                "fallback target name"
+                if lookup_source == "target name"
+                else "final_item_name"
+            )
+            resolved_item, lookup_warnings = validation_item_lookup(
+                lookup_name,
+                cache,
+                DEFAULT_ITEM_CACHE_PATH,
+                index,
+                label,
+                reference_database,
+            )
+            target_warnings.extend(lookup_warnings)
+
+            if resolved_item:
+                final_item_id = int(resolved_item["item_id"])
+                resolved_final_item_name = resolved_item.get("name", lookup_name)
+                final_resolution = f"yes ({label})"
+            else:
+                final_resolution = f"no ({label} did not resolve)"
+        elif target.get("auto_resolve_final_item_from_name", True) is False:
+            final_resolution = "skipped (fallback disabled)"
+
+        material_name_warnings: list[str] = []
+
+        for material in target.get("materials", []):
+            if material_has_item_id(material):
+                continue
+
+            material_name = str(material.get("name", "")).strip()
+
+            if not material_name:
+                material_name_warnings.append("A material is missing both item_id and name.")
+                continue
+
+            _material_item, lookup_warnings = validation_item_lookup(
+                material_name,
+                cache,
+                DEFAULT_ITEM_CACHE_PATH,
+                index,
+                "material name",
+                reference_database,
+            )
+            material_name_warnings.extend(lookup_warnings)
+
+        target_warnings.extend(material_name_warnings)
+        recipe_lookup, recipe_warnings = validate_recipe_lookup(
+            recipe_engine,
+            final_item_id,
+            resolved_final_item_name,
+        )
+        target_warnings.extend(recipe_warnings)
+        total_warnings += len(target_warnings)
+
+        lines.append(f"Target {target_number}: {target_name}")
+        lines.append(
+            "  final_item_id: "
+            f"{final_item_id if final_item_id is not None else 'not set'}"
+        )
+        lines.append(
+            "  final_item_name: "
+            f"{resolved_final_item_name if resolved_final_item_name else 'not set'}"
+        )
+        lines.append(f"  Final item resolution: {final_resolution}")
+        lines.append(f"  Recipe lookup: {recipe_lookup}")
+
+        if target_warnings:
+            lines.append("  Warnings:")
+            for warning in target_warnings:
+                lines.append(f"    - {warning}")
+
+        lines.append("")
+
+    lines.append(f"Validation warnings: {total_warnings:,}")
+    return "\n".join(lines).rstrip()
+
+
+def resolve_targets_for_override_generation(
+    config_path: Path,
+    rebuild_item_index: bool = False,
+) -> list[dict[str, Any]]:
+    """Load targets and resolve final item IDs without account scanning."""
+
+    targets = load_goals(config_path)
+    return resolve_target_final_item_names(
+        targets,
+        DEFAULT_ITEM_CACHE_PATH,
+        DEFAULT_ITEM_NAME_INDEX_PATH,
+        rebuild_item_index=rebuild_item_index,
+    )
+
+
+def resolve_targets_for_reference_update(
+    config_path: Path,
+    rebuild_item_index: bool = False,
+) -> list[dict[str, Any]]:
+    """Load targets and resolve names needed for targeted reference imports."""
+
+    targets = load_goals(config_path)
+    targets = resolve_goal_material_names(
+        targets,
+        DEFAULT_ITEM_CACHE_PATH,
+        DEFAULT_ITEM_NAME_INDEX_PATH,
+        rebuild_item_index=rebuild_item_index,
+    )
+    return resolve_target_final_item_names(
+        targets,
+        DEFAULT_ITEM_CACHE_PATH,
+        DEFAULT_ITEM_NAME_INDEX_PATH,
+        rebuild_item_index=rebuild_item_index,
+    )
+
+
+def load_override_database(overrides_path: Path) -> dict[str, Any]:
+    """Load recipe_overrides.json, creating the default shape if needed."""
+
+    if not overrides_path.exists():
+        return {
+            "version": 1,
+            "instructions": [
+                "Use this file for manual or special-case recipe data the official GW2 API cannot fully resolve.",
+                "final_item_id in a target is still the most explicit way to identify a legendary.",
+                "Overrides may use item_id or name. item_id is preferred because it cannot be ambiguous.",
+                "Supported types: manual, currency, achievement, collection, mystic_forge, vendor, time_gated, account_bound.",
+                "Add ingredients only after manually verifying them. Ingredients should use item_id when possible.",
+            ],
+            "preferred_recipes_by_output": {},
+            "overrides": [],
+        }
+
+    with overrides_path.open("r", encoding="utf-8") as overrides_file:
+        overrides = json.load(overrides_file)
+
+    if not isinstance(overrides, dict):
+        raise ValueError(f"{overrides_path} must contain one JSON object.")
+
+    if not isinstance(overrides.get("overrides", []), list):
+        raise ValueError(f"{overrides_path} field 'overrides' must be a list.")
+
+    overrides.setdefault("version", 1)
+    overrides.setdefault("preferred_recipes_by_output", {})
+    overrides.setdefault("overrides", [])
+    return overrides
+
+
+def save_override_database(overrides_path: Path, overrides: dict[str, Any]) -> None:
+    """Save recipe_overrides.json."""
+
+    overrides_path.parent.mkdir(parents=True, exist_ok=True)
+    overrides_path.write_text(
+        json.dumps(overrides, indent=2, sort_keys=False) + "\n",
+        encoding="utf-8",
+    )
+
+
+def override_database_has_item(overrides: dict[str, Any], item_id: int, name: str) -> bool:
+    """Check whether an override already exists for this item ID or name."""
+
+    normalized_name = normalize_item_name(name) if name else ""
+
+    for override in overrides.get("overrides", []):
+        if not isinstance(override, dict):
+            continue
+
+        override_item_id = override.get("item_id", override.get("id"))
+
+        if override_item_id is not None and int(override_item_id) == item_id:
+            return True
+
+        override_name = str(override.get("name", "")).strip()
+
+        if normalized_name and normalize_item_name(override_name) == normalized_name:
+            return True
+
+    return False
+
+
+def target_missing_override_stub(
+    recipe_engine: RecipeEngine,
+    overrides: dict[str, Any],
+    target: dict[str, Any],
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Return an override stub when a resolved final item needs one."""
+
+    final_item_id = target_final_item_id(target)
+    warnings = list(target.get(RECIPE_ENGINE_WARNINGS_FIELD, []))
+
+    if final_item_id is None:
+        return None, warnings
+
+    final_item_name = str(
+        target.get("final_item_name") or target.get("name") or f"Item {final_item_id}"
+    ).strip()
+
+    if recipe_engine.override_for_item(final_item_id, final_item_name):
+        return None, warnings
+
+    if override_database_has_item(overrides, final_item_id, final_item_name):
+        return None, warnings
+
+    try:
+        recipe_ids = recipe_engine.recipe_ids_for_output(final_item_id)
+    except RecipeApiError as error:
+        warnings.append(f"Skipped override generation because recipe lookup failed: {error}")
+        return None, warnings
+
+    if recipe_ids:
+        return None, warnings
+
+    return (
+        {
+            "item_id": final_item_id,
+            "name": final_item_name,
+            "type": "mystic_forge",
+            "verified": False,
+            "ingredients": [],
+            "notes": "Fill this with verified legendary recipe ingredients.",
+        },
+        warnings,
+    )
+
+
+def target_needs_wiki_import(
+    recipe_engine: RecipeEngine,
+    target: dict[str, Any],
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Return a wiki import item for an unresolved configured target."""
+
+    final_item_id = target_final_item_id(target)
+    warnings = list(target.get(RECIPE_ENGINE_WARNINGS_FIELD, []))
+
+    if final_item_id is None:
+        return None, warnings
+
+    final_item_name = str(
+        target.get("final_item_name") or target.get("name") or f"Item {final_item_id}"
+    ).strip()
+
+    try:
+        recipe_ids = recipe_engine.recipe_ids_for_output(final_item_id)
+    except RecipeApiError as error:
+        warnings.append(f"Skipped wiki import because recipe lookup failed: {error}")
+        return None, warnings
+
+    if recipe_ids:
+        return None, warnings
+
+    override = recipe_engine.override_for_item(final_item_id, final_item_name)
+
+    if override and override.get("verified") and override.get("ingredients"):
+        return None, warnings
+
+    return {"item_id": final_item_id, "name": final_item_name}, warnings
+
+
+def collect_wiki_import_items_for_targets(
+    targets: list[dict[str, Any]],
+    recipe_engine: RecipeEngine,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Collect unique unresolved target and configured ingredient items."""
+
+    items_by_id: dict[int, dict[str, Any]] = {}
+    warnings: list[str] = []
+
+    for target in targets:
+        item, target_warnings = target_needs_wiki_import(recipe_engine, target)
+        warnings.extend(target_warnings)
+
+        if item is None:
+            pass
+        else:
+            items_by_id[int(item["item_id"])] = item
+
+        final_item_id = target_final_item_id(target)
+
+        if final_item_id is not None:
+            try:
+                recipe_tree = recipe_engine.resolve_recipe_tree(final_item_id)
+            except RecipeApiError as error:
+                warnings.append(
+                    f"Skipped wiki import for recipe-tree gaps in "
+                    f"{target.get('name', 'Unnamed target')} because recipe lookup "
+                    f"failed: {error}"
+                )
+            else:
+                for manual_step in recipe_tree.get("unknown_manual_steps", []):
+                    manual_item_id = manual_step.get("item_id")
+
+                    if manual_item_id is None:
+                        continue
+
+                    manual_item_id = int(manual_item_id)
+                    manual_item_name = str(
+                        manual_step.get("name") or f"Item {manual_item_id}"
+                    )
+                    override = recipe_engine.override_for_item(
+                        manual_item_id,
+                        manual_item_name,
+                    )
+
+                    if override and override.get("verified") and override.get("ingredients"):
+                        continue
+
+                    items_by_id[manual_item_id] = {
+                        "item_id": manual_item_id,
+                        "name": manual_item_name,
+                    }
+
+        target_name = str(target.get("name", "Unnamed target"))
+        material_entries = normalize_goal_entries(
+            target_name,
+            target.get("materials", []),
+            ("item_id", "id"),
+            "materials",
+        )
+
+        for material in material_entries:
+            material_id = int(material["id"])
+            material_name = str(material.get("name") or f"Item {material_id}")
+
+            try:
+                recipe_ids = recipe_engine.recipe_ids_for_output(material_id)
+            except RecipeApiError as error:
+                warnings.append(
+                    f"Skipped wiki import for {material_name} because recipe lookup failed: {error}"
+                )
+                continue
+
+            if recipe_ids:
+                continue
+
+            override = recipe_engine.override_for_item(material_id, material_name)
+
+            if override and override.get("verified") and override.get("ingredients"):
+                continue
+
+            items_by_id[material_id] = {
+                "item_id": material_id,
+                "name": material_name,
+            }
+
+    return list(items_by_id.values()), warnings
+
+
+def build_generate_missing_overrides_report(
+    config_path: Path,
+    rebuild_item_index: bool = False,
+) -> str:
+    """Create missing legendary override stubs for resolved targets."""
+
+    validate_template_files(DEFAULT_TEMPLATES_DIR)
+    targets = resolve_targets_for_override_generation(
+        config_path,
+        rebuild_item_index=rebuild_item_index,
+    )
+    overrides_path = Path("data") / "recipe_overrides.json"
+    overrides = load_override_database(overrides_path)
+    recipe_engine = RecipeEngine()
+    created_stubs: list[dict[str, Any]] = []
+    warnings: list[str] = []
+
+    for target in targets:
+        stub, target_warnings = target_missing_override_stub(
+            recipe_engine,
+            overrides,
+            target,
+        )
+        warnings.extend(target_warnings)
+
+        if stub is None:
+            continue
+
+        overrides["overrides"].append(stub)
+        created_stubs.append(stub)
+
+    if created_stubs:
+        save_override_database(overrides_path, overrides)
+
+    lines = [
+        "Guild Wars 2 Legendary Planner Missing Override Generator",
+        "===========================================================",
+        f"Config: {config_path}",
+        f"Override file: {overrides_path}",
+        f"Stubs created: {len(created_stubs):,}",
+    ]
+
+    if created_stubs:
+        lines.append("")
+        lines.append("Created override stubs:")
+
+        for stub in created_stubs:
+            lines.append(f"  - {stub['name']} (item_id {stub['item_id']})")
+    else:
+        lines.append("")
+        lines.append("No missing override stubs needed.")
+
+    if warnings:
+        lines.append("")
+        lines.append("Warnings:")
+        for warning in warnings:
+            lines.append(f"  - {warning}")
+
+    return "\n".join(lines).rstrip()
+
+
+def build_reference_db_setup_report(
+    config_path: Path,
+    update: bool = False,
+    rebuild_item_index: bool = False,
+) -> str:
+    """Build or refresh the public reference database and report the result."""
+
+    action = "Update" if update else "Setup"
+    counts = setup_reference_database(
+        DEFAULT_REFERENCE_DB_PATH,
+        Path("data") / "recipe_overrides.json",
+    )
+    targets = resolve_targets_for_reference_update(
+        config_path,
+        rebuild_item_index=rebuild_item_index,
+    )
+    recipe_engine = RecipeEngine()
+    wiki_items, wiki_warnings = collect_wiki_import_items_for_targets(
+        targets,
+        recipe_engine,
+    )
+    database = ReferenceDatabase(DEFAULT_REFERENCE_DB_PATH)
+    wiki_counts = database.import_wiki_recipes_for_items(wiki_items)
+    return "\n".join(
+        [
+            f"Guild Wars 2 Planner Reference Database {action}",
+            "=" * (48 + len(action)),
+            f"Database: {DEFAULT_REFERENCE_DB_PATH}",
+            f"Items imported: {counts['items']:,}",
+            f"Official recipes imported: {counts['recipes']:,}",
+            f"Recipe overrides applied: {counts['overrides']:,}",
+            f"Targeted wiki pages imported: {wiki_counts['wiki_pages']:,}",
+            f"Wiki acquisition options imported: {wiki_counts['acquisition_options']:,}",
+        ]
+        + (
+            ["", "Warnings:"]
+            + [f"  - {warning}" for warning in wiki_warnings]
+            if wiki_warnings
+            else []
+        )
+    )
+
+
+def build_reference_db_status_report() -> str:
+    """Build a readable reference database status report."""
+
+    status = reference_database_status(DEFAULT_REFERENCE_DB_PATH)
+    lines = [
+        "Guild Wars 2 Planner Reference Database Status",
+        "================================================",
+        f"Database: {status.get('path', DEFAULT_REFERENCE_DB_PATH)}",
+    ]
+
+    if status.get("exists") != "true":
+        lines.extend(
+            [
+                "Status: missing",
+                "Run python gw2_legendary_planner.py --setup-reference-db to create it.",
+            ]
+        )
+        return "\n".join(lines)
+
+    lines.append("Status: ready")
+
+    for key in (
+        "schema_version",
+        "items_rows",
+        "item_names_rows",
+        "recipes_rows",
+        "recipe_ingredients_rows",
+        "recipe_outputs_rows",
+        "wiki_recipes_rows",
+        "acquisition_options_rows",
+        "recipe_overrides_rows",
+        "items_updated_at",
+        "recipes_updated_at",
+        "overrides_updated_at",
+        "wiki_recipes_updated_at",
+        "wiki_recipe_import_count",
+        "wiki_acquisition_option_count",
+    ):
+        if key in status:
+            lines.append(f"{key}: {status[key]}")
+
+    return "\n".join(lines)
 
 
 def normalize_goal_entries(
@@ -1312,7 +2385,7 @@ def collect_goal_ids(targets: list[dict[str, Any]]) -> tuple[set[int], set[int]]
 
         material_entries = normalize_goal_entries(
             target_name,
-            target.get("materials", []),
+            target_materials(target),
             ("item_id", "id"),
             "materials",
         )
@@ -1395,6 +2468,7 @@ def collect_missing_item_ids(
     targets: list[dict[str, Any]],
     item_counts: dict[int, int],
     legendary_armory: dict[int, int],
+    recipe_engine: RecipeEngine | None = None,
 ) -> set[int]:
     """Collect item IDs that are missing from at least one enabled target."""
 
@@ -1407,13 +2481,22 @@ def collect_missing_item_ids(
         target_name = target.get("name", "Unnamed target")
         material_entries = normalize_goal_entries(
             target_name,
-            target.get("materials", []),
+            target_materials(target),
             ("item_id", "id"),
             "materials",
         )
 
         for entry in material_entries:
             if item_counts.get(entry["id"], 0) < entry["amount"]:
+                if recipe_engine and recipe_engine.is_item_non_priceable_override(
+                    entry["id"],
+                    entry.get("name"),
+                ):
+                    debug_print(
+                        f"Skipping Trading Post price for override item {entry['id']}."
+                    )
+                    continue
+
                 missing_item_ids.add(entry["id"])
 
     return missing_item_ids
@@ -1594,6 +2677,9 @@ def target_needs_recipe_data(
 ) -> bool:
     """Decide whether a target still needs recipe/configuration data."""
 
+    if target.get(RECIPE_ENGINE_WARNINGS_FIELD) or target.get(RECIPE_UNKNOWN_STEPS_FIELD):
+        return True
+
     if target_recipe_status_needs_work(target):
         return True
 
@@ -1647,7 +2733,7 @@ def build_target_status(
     target_name = target.get("name", "Unnamed target")
     material_entries = normalize_goal_entries(
         target_name,
-        target.get("materials", []),
+        target_materials(target),
         ("item_id", "id"),
         "materials",
     )
@@ -1690,6 +2776,8 @@ def build_target_status(
         "incomplete_steps": incomplete_steps,
         "configuration_steps": configuration_steps,
         "gameplay_steps": gameplay_steps,
+        "recipe_engine_warnings": list(target.get(RECIPE_ENGINE_WARNINGS_FIELD, [])),
+        "recipe_unknown_manual_steps": list(target.get(RECIPE_UNKNOWN_STEPS_FIELD, [])),
         "needs_recipe_data": needs_recipe_data,
         "missing_items": missing_items,
         "missing_currencies": missing_currencies,
@@ -1766,6 +2854,55 @@ def make_step_lines(
             line += f" - {step['notes']}"
 
         lines.append(line)
+
+    return lines
+
+
+def make_recipe_engine_lines(target: dict[str, Any], detailed: bool = False) -> list[str]:
+    """Build report lines for automatic recipe resolution."""
+
+    recipe_tree = target.get(RECIPE_TREE_FIELD)
+    warnings = list(target.get(RECIPE_ENGINE_WARNINGS_FIELD, []))
+    manual_steps = list(target.get(RECIPE_UNKNOWN_STEPS_FIELD, []))
+    auto_materials = list(target.get(AUTO_RECIPE_MATERIALS_FIELD, []))
+
+    if not recipe_tree and not warnings and not manual_steps:
+        if detailed:
+            return ["    Automatic recipe lookup did not run."]
+
+        return []
+
+    lines: list[str] = []
+
+    if recipe_tree:
+        recipes_used = recipe_tree.get("recipes_used", [])
+        craftable_ingredients = recipe_tree.get("craftable_ingredients", [])
+        lines.append(
+            f"    Official API recipes used: {len(recipes_used):,}; "
+            f"terminal materials added: {len(auto_materials):,}; "
+            f"craftable ingredient types found: {len(craftable_ingredients):,}."
+        )
+
+        if detailed and craftable_ingredients:
+            lines.append("    Craftable ingredients in the resolved tree:")
+            for ingredient in craftable_ingredients:
+                lines.append(
+                    f"      - {ingredient['name']}: {ingredient['amount']:,} "
+                    f"via recipe {ingredient['recipe_id']}"
+                )
+
+    if manual_steps:
+        lines.append("    Manual recipe gaps:")
+        for manual_step in manual_steps:
+            lines.append(
+                f"      - {manual_step['name']}: {manual_step['amount']:,} needed. "
+                f"{manual_step['reason']}"
+            )
+
+    if warnings:
+        lines.append("    Warnings:")
+        for warning in warnings:
+            lines.append(f"      - {warning}")
 
     return lines
 
@@ -2007,6 +3144,15 @@ def build_configuration_recommendations(target_status: dict[str, Any]) -> list[s
             "exact materials, currencies, and final_item_id where known."
         )
 
+    for warning in target_status["recipe_engine_warnings"][:2]:
+        recommendations.append(f"Recipe engine: {warning}")
+
+    for manual_step in target_status["recipe_unknown_manual_steps"][:2]:
+        recommendations.append(
+            f"Recipe gap: review {manual_step['name']} "
+            f"({manual_step['amount']:,} needed). {manual_step['reason']}"
+        )
+
     for step in target_status["configuration_steps"]:
         recommendations.append(step_recommendation_text(step))
 
@@ -2207,6 +3353,12 @@ def build_report(
             f"Target {target_number}: {target_name} [{target_status['status_label']}]"
         )
 
+        recipe_engine_lines = make_recipe_engine_lines(target, detailed=detailed)
+
+        if recipe_engine_lines:
+            lines.append("  Recipe engine:")
+            lines.extend(recipe_engine_lines)
+
         if target_status["is_unlocked"]:
             final_item_name = item_names.get(final_item_id, f"Item {final_item_id}")
             lines.append(f"  Already unlocked in Legendary Armory: {final_item_name}")
@@ -2297,6 +3449,31 @@ def parse_args() -> argparse.Namespace:
         help="Optional path for saving the report as a text file.",
     )
     parser.add_argument(
+        "--validate-goals",
+        action="store_true",
+        help="Validate goal/template configuration without scanning the account.",
+    )
+    parser.add_argument(
+        "--generate-missing-overrides",
+        action="store_true",
+        help="Create recipe override stubs for resolved targets missing official recipes.",
+    )
+    parser.add_argument(
+        "--setup-reference-db",
+        action="store_true",
+        help="Build the local public reference database from official API data.",
+    )
+    parser.add_argument(
+        "--update-reference-db",
+        action="store_true",
+        help="Refresh the local public reference database from official API data.",
+    )
+    parser.add_argument(
+        "--reference-db-status",
+        action="store_true",
+        help="Show local public reference database status.",
+    )
+    parser.add_argument(
         "--show-complete",
         action="store_true",
         help="Also show goals that are already complete.",
@@ -2346,6 +3523,57 @@ def main() -> int:
     DEBUG_OUTPUT = output_mode == OUTPUT_MODE_DEBUG
 
     try:
+        if args.validate_goals:
+            validation_report = build_validate_goals_report(
+                Path(args.config),
+                rebuild_item_index=args.rebuild_item_index,
+            )
+            print(validation_report)
+            return 0
+
+        if args.generate_missing_overrides:
+            override_report = build_generate_missing_overrides_report(
+                Path(args.config),
+                rebuild_item_index=args.rebuild_item_index,
+            )
+            print(override_report)
+            return 0
+
+        if args.setup_reference_db:
+            print(
+                build_reference_db_setup_report(
+                    Path(args.config),
+                    update=False,
+                    rebuild_item_index=args.rebuild_item_index,
+                )
+            )
+            return 0
+
+        if args.update_reference_db:
+            print(
+                build_reference_db_setup_report(
+                    Path(args.config),
+                    update=True,
+                    rebuild_item_index=args.rebuild_item_index,
+                )
+            )
+            return 0
+
+        if args.reference_db_status:
+            print(build_reference_db_status_report())
+            return 0
+
+        if not DEFAULT_REFERENCE_DB_PATH.exists():
+            print(
+                f"Warning: local reference database not found at {DEFAULT_REFERENCE_DB_PATH}."
+            )
+            print(
+                "Normal runs will use legacy public API caches for now. "
+                "Run python gw2_legendary_planner.py --setup-reference-db to build "
+                "the local reference database."
+            )
+            print()
+
         api_key = find_api_key(Path(args.env) if args.env else None)
 
         debug_print("Checking API key permissions...")
@@ -2359,6 +3587,14 @@ def main() -> int:
             DEFAULT_ITEM_NAME_INDEX_PATH,
             rebuild_item_index=args.rebuild_item_index,
         )
+        targets = resolve_target_final_item_names(
+            targets,
+            DEFAULT_ITEM_CACHE_PATH,
+            DEFAULT_ITEM_NAME_INDEX_PATH,
+            rebuild_item_index=args.rebuild_item_index,
+        )
+        recipe_engine = RecipeEngine()
+        targets = resolve_target_recipe_data(targets, recipe_engine)
 
         legendary_armory: dict[int, int] = {}
         armory_summary: dict[str, Any] = {
@@ -2397,10 +3633,21 @@ def main() -> int:
         if args.no_prices:
             debug_print("Skipping Trading Post prices because --no-prices was used.")
         else:
-            missing_item_ids = collect_missing_item_ids(targets, item_counts, legendary_armory)
+            missing_item_ids = collect_missing_item_ids(
+                targets,
+                item_counts,
+                legendary_armory,
+                recipe_engine,
+            )
             price_estimates = get_price_estimates(missing_item_ids, DEFAULT_PRICE_CACHE_PATH)
 
-        item_names = fetch_names("/items", item_ids) if item_ids else {}
+        item_names = fetch_item_names_from_reference(item_ids) if item_ids else {}
+
+        if item_ids - set(item_names):
+            missing_name_ids = item_ids - set(item_names)
+            fetched_item_names = fetch_names("/items", missing_name_ids)
+            item_names.update(fetched_item_names)
+
         currency_names = fetch_names("/currencies", currency_ids) if currency_ids else {}
 
         report = build_report(
@@ -2433,6 +3680,8 @@ def main() -> int:
         json.JSONDecodeError,
         Gw2ApiError,
         ItemLookupError,
+        ReferenceApiError,
+        WikiImportError,
     ) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1
