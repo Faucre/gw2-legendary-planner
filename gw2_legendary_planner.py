@@ -4789,6 +4789,182 @@ ACTION_BUCKET_TITLES = {
 }
 
 
+CONFIDENCE_STRENGTH = {
+    "manual_override_verified": 4,
+    "official_api": 3,
+    "wiki_imported_unreviewed": 2,
+    "manual_review_needed": 1,
+    "ambiguous": 0,
+}
+
+
+def confidence_rank(confidence: str) -> int:
+    """Return a simple trust rank for choosing the best merged entry."""
+
+    return CONFIDENCE_STRENGTH.get(normalize_item_name(confidence), -1)
+
+
+def action_entry_key(entry: dict[str, Any]) -> tuple[str, str]:
+    """Use item id when available, then fall back to normalized item name."""
+
+    item_id = entry.get("id", entry.get("item_id"))
+
+    if item_id is not None:
+        return ("id", str(item_id))
+
+    return ("name", normalize_item_name(str(entry.get("name", ""))))
+
+
+def unique_nonempty_text(values: list[Any]) -> list[str]:
+    """Keep useful text values in original order without duplicates."""
+
+    seen: set[str] = set()
+    unique_values: list[str] = []
+
+    for value in values:
+        text = str(value).strip()
+
+        if not text or text in seen:
+            continue
+
+        seen.add(text)
+        unique_values.append(text)
+
+    return unique_values
+
+
+def merge_action_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Merge duplicate action entries while preserving paths and source details."""
+
+    merged_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+
+    for entry in entries:
+        key = action_entry_key(entry)
+        current = merged_by_key.get(key)
+
+        if current is None:
+            merged_by_key[key] = dict(entry)
+            merged_by_key[key]["paths"] = unique_nonempty_text(list(entry.get("paths", [])))
+            merged_by_key[key]["secondary_sources"] = []
+            continue
+
+        current_confidence = str(current.get("data_confidence", ""))
+        new_confidence = str(entry.get("data_confidence", ""))
+
+        if confidence_rank(new_confidence) > confidence_rank(current_confidence):
+            for field in (
+                "category",
+                "data_confidence",
+                "resolution_source",
+                "source_url",
+                "review_status",
+                "source_type",
+                "source_step_summary",
+            ):
+                if entry.get(field):
+                    current[field] = entry[field]
+
+        current["owned"] = max(int(current.get("owned", 0)), int(entry.get("owned", 0)))
+        current["needed"] = max(
+            int(current.get("needed", current.get("amount", 0))),
+            int(entry.get("needed", entry.get("amount", 0))),
+        )
+        current["amount"] = max(
+            int(current.get("amount", current.get("needed", 0))),
+            int(entry.get("amount", entry.get("needed", 0))),
+        )
+        current["missing"] = max(
+            int(current.get("missing", 0)),
+            int(entry.get("missing", 0)),
+        )
+        current["paths"] = unique_nonempty_text(
+            list(current.get("paths", [])) + list(entry.get("paths", []))
+        )
+
+        secondary_sources = list(current.get("secondary_sources", []))
+        secondary_sources.append(
+            {
+                "category": entry.get("category", ""),
+                "data_confidence": entry.get("data_confidence", ""),
+                "resolution_source": entry.get("resolution_source", ""),
+                "source_url": entry.get("source_url", ""),
+            }
+        )
+        current["secondary_sources"] = [
+            source
+            for index, source in enumerate(secondary_sources)
+            if source not in secondary_sources[:index]
+        ]
+
+    return list(merged_by_key.values())
+
+
+def sort_action_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Put the most useful action-plan entries first."""
+
+    priority_names = {
+        "nyr hrammr": 0,
+        "mystic clover": 1,
+        "mystic runestone": 2,
+        "bloodstone shard": 3,
+        "eldritch scroll": 4,
+        "gift of research": 5,
+        "gift of the mists": 6,
+    }
+
+    def sort_key(entry: dict[str, Any]) -> tuple[int, int, str]:
+        normalized_name = normalize_item_name(str(entry.get("name", "")))
+        priority = priority_names.get(normalized_name, 50)
+        missing = int(entry.get("missing", 0))
+        return (priority, -missing, normalized_name)
+
+    return sorted(entries, key=sort_key)
+
+
+def manual_review_group_name(entry: dict[str, Any]) -> str:
+    """Group noisy manual-review items into player-friendly buckets."""
+
+    normalized_name = normalize_item_name(str(entry.get("name", "")))
+    name = str(entry.get("name", ""))
+    category = str(entry.get("category", ""))
+
+    trophy_words = ("blood", "bones", "claws", "dust", "fangs", "scales", "totems", "venom")
+
+    if normalized_name.startswith("gift of ") and any(word in normalized_name for word in trophy_words):
+        return "Trophy gifts"
+
+    if any(word in normalized_name for word in ("janthir", "lowland", "ursus", "syntri")):
+        return "Janthir gifts"
+
+    if any(word in normalized_name for word in ("mists", "glory", "war", "battle")):
+        return "Mists/PvP/WvW gifts"
+
+    if normalized_name in {"bloodstone shard", "eldritch scroll", "mystic runestone"}:
+        return "Vendor/source items"
+
+    if "research" in normalized_name or "hydrocatalytic" in normalized_name:
+        return "Research/currency items"
+
+    if category == "achievement/collection step":
+        return "Achievement/collection steps"
+
+    if name.startswith("Gift of "):
+        return "Other gifts"
+
+    return "Other manual review"
+
+
+def summarize_entry_names(entries: list[dict[str, Any]], limit: int = 6) -> str:
+    """Return a compact comma-separated name summary."""
+
+    names = [str(entry.get("name", "Unnamed item")) for entry in entries]
+
+    if len(names) <= limit:
+        return ", ".join(names)
+
+    return f"{', '.join(names[:limit])}, and {len(names) - limit} more"
+
+
 def build_action_plan_from_breakdown(breakdown: dict[str, Any]) -> dict[str, Any]:
     """Convert a target breakdown into strategy buckets."""
 
@@ -4803,9 +4979,12 @@ def build_action_plan_from_breakdown(breakdown: dict[str, Any]) -> dict[str, Any
     entries.extend(breakdown.get("terminal_missing_materials", []))
     entries.extend(breakdown.get("account_bound_manual_source_steps", []))
 
-    for entry in entries:
+    for entry in merge_action_entries(entries):
         entry_with_options = entry_with_acquisition_options(entry)
         buckets[action_bucket_name(entry_with_options)].append(entry_with_options)
+
+    for bucket_name, bucket_entries in buckets.items():
+        buckets[bucket_name] = sort_action_entries(bucket_entries)
 
     warnings = list(breakdown.get("warnings", []))
     suspicious_warnings = [
@@ -4829,6 +5008,7 @@ def build_action_plan_from_breakdown(breakdown: dict[str, Any]) -> dict[str, Any
 def format_action_plan_entry(
     entry: dict[str, Any],
     show_paths: bool = False,
+    detailed: bool = True,
 ) -> list[str]:
     """Format one action-plan entry."""
 
@@ -4843,7 +5023,9 @@ def format_action_plan_entry(
         option_labels = ", ".join(option["label"] for option in options[:3])
         lines.append(f"    Options: {option_labels}")
 
-        for option in options[:2]:
+        option_details = options[:2] if detailed else []
+
+        for option in option_details:
             details = []
 
             if option.get("time_gate"):
@@ -4875,11 +5057,138 @@ def format_action_plan_entry(
     elif paths and important_path_entry(entry):
         lines.append(f"    Used in: {paths[0]}")
 
+    secondary_sources = list(entry.get("secondary_sources", []))
+
+    if detailed and secondary_sources:
+        lines.append("    Secondary sources:")
+
+        for source in secondary_sources[:4]:
+            source_bits = [
+                str(source.get("category", "")).strip(),
+                str(source.get("data_confidence", "")).strip(),
+                str(source.get("resolution_source", "")).strip(),
+            ]
+            source_text = "; ".join(bit for bit in source_bits if bit)
+
+            if source_text:
+                lines.append(f"      - {source_text}")
+
     return lines
 
 
-def format_action_plan(action_plan: dict[str, Any], show_paths: bool = False) -> str:
-    """Turn an action plan into readable CLI output."""
+def format_group_summary(
+    title: str,
+    entries: list[dict[str, Any]],
+    limit: int = 5,
+) -> list[str]:
+    """Format a concise grouped summary section."""
+
+    lines = [title]
+
+    if not entries:
+        lines.append("  - None right now.")
+        return lines
+
+    shown_entries = entries[:limit]
+
+    for entry in shown_entries:
+        lines.extend(format_action_plan_entry(entry, detailed=False))
+
+    if len(entries) > limit:
+        lines.append(f"  - {len(entries) - limit} more hidden; use --detailed to see all.")
+
+    return lines
+
+
+def format_buy_vendor_summary(entries: list[dict[str, Any]]) -> list[str]:
+    """Format vendor-like items as one compact shopping/source list."""
+
+    lines = ["Buy/vendor summary"]
+
+    if not entries:
+        lines.append("  - No vendor-like items found yet.")
+        return lines
+
+    lines.append(f"  - {summarize_entry_names(entries)}")
+
+    spirit_shard_entries = [
+        entry
+        for entry in entries
+        if normalize_item_name(str(entry.get("name", ""))) in {"bloodstone shard", "eldritch scroll"}
+    ]
+
+    if spirit_shard_entries:
+        lines.append("    Spirit Shard vendor-like items are marked unverified until costs are reviewed.")
+
+    runestone_entries = [
+        entry
+        for entry in entries
+        if normalize_item_name(str(entry.get("name", ""))) == "mystic runestone"
+    ]
+
+    if runestone_entries:
+        lines.append("    Mystic Runestone: check the vendor/source plan before treating it as a generic material.")
+
+    return lines
+
+
+def format_farm_gather_summary(entries: list[dict[str, Any]]) -> list[str]:
+    """Format farm/gather work without dumping every material line."""
+
+    lines = ["Farm/gather summary"]
+
+    if not entries:
+        lines.append("  - No farm/gather group found yet.")
+        return lines
+
+    janthir_entries = [
+        entry
+        for entry in entries
+        if any(
+            word in normalize_item_name(str(entry.get("name", "")))
+            for word in ("janthir", "lowland", "mursaat", "honey flower", "titan", "rotted titan amber")
+        )
+    ]
+    other_entries = [entry for entry in entries if entry not in janthir_entries]
+
+    if janthir_entries:
+        lines.append(f"  - Janthir materials: {summarize_entry_names(janthir_entries)}")
+
+    if other_entries:
+        lines.append(f"  - Other materials: {summarize_entry_names(other_entries)}")
+
+    return lines
+
+
+def format_manual_review_summary(entries: list[dict[str, Any]]) -> list[str]:
+    """Collapse manual-review noise into grouped counts for the default action plan."""
+
+    lines = ["Manual review summary"]
+
+    if not entries:
+        lines.append("  - No manual review items found yet.")
+        return lines
+
+    grouped_entries: dict[str, list[dict[str, Any]]] = {}
+
+    for entry in entries:
+        grouped_entries.setdefault(manual_review_group_name(entry), []).append(entry)
+
+    total_count = sum(len(group) for group in grouped_entries.values())
+    lines.append(f"  - {total_count} item(s) need review. Use --detailed to see every entry.")
+
+    for group_name in sorted(grouped_entries):
+        group_entries = sort_action_entries(grouped_entries[group_name])
+        lines.append(f"  - {group_name}: {summarize_entry_names(group_entries)}")
+
+    return lines
+
+
+def format_action_plan_detailed(
+    action_plan: dict[str, Any],
+    show_paths: bool = False,
+) -> str:
+    """Turn a full action plan into readable CLI output."""
 
     target = action_plan["target"]
     lines = [
@@ -4896,7 +5205,13 @@ def format_action_plan(action_plan: dict[str, Any], show_paths: bool = False) ->
 
         if entries:
             for entry in entries:
-                lines.extend(format_action_plan_entry(entry, show_paths=show_paths))
+                lines.extend(
+                    format_action_plan_entry(
+                        entry,
+                        show_paths=show_paths,
+                        detailed=True,
+                    )
+                )
         else:
             lines.append("  - None right now.")
 
@@ -4921,6 +5236,60 @@ def format_action_plan(action_plan: dict[str, Any], show_paths: bool = False) ->
     return "\n".join(lines).rstrip()
 
 
+def format_action_plan_summary(action_plan: dict[str, Any]) -> str:
+    """Turn an action plan into a concise player-facing next-actions screen."""
+
+    target = action_plan["target"]
+    buckets = action_plan["buckets"]
+    lines = [
+        "Legendary Action Plan",
+        "=====================",
+        f"Target: {target['name']}",
+        f"Status: {action_plan['status']}",
+        "",
+    ]
+
+    lines.extend(format_group_summary("Priority blockers", buckets.get("priority_blockers", []), limit=5))
+    lines.append("")
+    lines.extend(format_group_summary("Do today / do soon", buckets.get("do_today", []), limit=5))
+    lines.append("")
+    lines.extend(format_buy_vendor_summary(buckets.get("buy_vendor", [])))
+    lines.append("")
+    lines.extend(format_farm_gather_summary(buckets.get("farm_gather", [])))
+    lines.append("")
+    lines.extend(format_manual_review_summary(buckets.get("manual_review", [])))
+    lines.append("")
+
+    if action_plan["suspicious_warnings"]:
+        warning_count = len(action_plan["suspicious_warnings"])
+        lines.append("Trust / review flags")
+        lines.append(f"  - {warning_count} warning(s). Use --detailed to review them.")
+        lines.append("")
+
+    lines.append("Recommended next actions")
+
+    if action_plan["recommendations"]:
+        for recommendation in action_plan["recommendations"][:5]:
+            lines.append(f"  - {recommendation}")
+    else:
+        lines.append("  - Start with the priority blockers above.")
+
+    return "\n".join(lines).rstrip()
+
+
+def format_action_plan(
+    action_plan: dict[str, Any],
+    show_paths: bool = False,
+    detailed: bool = False,
+) -> str:
+    """Turn an action plan into either summary or detailed CLI output."""
+
+    if detailed or show_paths:
+        return format_action_plan_detailed(action_plan, show_paths=show_paths)
+
+    return format_action_plan_summary(action_plan)
+
+
 def build_action_plan_report(
     targets: list[dict[str, Any]],
     wallet: dict[int, int],
@@ -4931,6 +5300,7 @@ def build_action_plan_report(
     target_name: str | None = None,
     use_priority: bool = False,
     show_paths: bool = False,
+    detailed: bool = False,
 ) -> str:
     """Build the focused CLI Action Plan v1 output."""
 
@@ -4951,6 +5321,7 @@ def build_action_plan_report(
     return format_action_plan(
         build_action_plan_from_breakdown(breakdown),
         show_paths=show_paths,
+        detailed=detailed,
     )
 
 
@@ -5421,6 +5792,11 @@ def parse_args() -> argparse.Namespace:
         help="Show fuller target details, including useful empty sections.",
     )
     parser.add_argument(
+        "--summary",
+        action="store_true",
+        help="Use concise summary output. This is the default for action plans.",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Show API, scan, and cache details for troubleshooting.",
@@ -5666,6 +6042,9 @@ def main() -> int:
             return 0
 
         if args.action_plan or args.action_plan_priority:
+            action_plan_detailed = (
+                output_mode in {OUTPUT_MODE_DETAILED, OUTPUT_MODE_DEBUG} or args.show_paths
+            ) and not args.summary
             report = build_action_plan_report(
                 targets,
                 wallet,
@@ -5676,6 +6055,7 @@ def main() -> int:
                 target_name=args.action_plan,
                 use_priority=args.action_plan_priority,
                 show_paths=args.show_paths,
+                detailed=action_plan_detailed,
             )
             print(report)
 

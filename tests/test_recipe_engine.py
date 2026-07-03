@@ -972,6 +972,99 @@ class RecipeEngineWikiFallbackTests(unittest.TestCase):
             "Unclear Collection Gift",
         )
 
+    def test_action_plan_merges_duplicate_entries_with_best_confidence(self) -> None:
+        breakdown = {
+            "target": {"name": "Klobjarne Geirr"},
+            "status": "In progress",
+            "major_branches": [
+                {
+                    "id": 10,
+                    "name": "Nyr Hrammr",
+                    "owned": 0,
+                    "needed": 1,
+                    "missing": 1,
+                    "category": "precursor",
+                    "data_confidence": "wiki_imported_unreviewed",
+                    "resolution_source": "wiki",
+                    "paths": ["Klobjarne Geirr > Nyr Hrammr"],
+                }
+            ],
+            "terminal_missing_materials": [
+                {
+                    "id": 10,
+                    "name": "Nyr Hrammr",
+                    "owned": 0,
+                    "needed": 1,
+                    "missing": 1,
+                    "category": "precursor",
+                    "data_confidence": "official_api",
+                    "resolution_source": "official_recipe",
+                    "paths": ["Klobjarne Geirr > Nyr Hrammr"],
+                }
+            ],
+            "account_bound_manual_source_steps": [],
+            "warnings": [],
+            "recommendations": [],
+        }
+
+        action_plan = build_action_plan_from_breakdown(breakdown)
+        blockers = action_plan["buckets"]["priority_blockers"]
+
+        self.assertEqual(len(blockers), 1)
+        self.assertEqual(blockers[0]["name"], "Nyr Hrammr")
+        self.assertEqual(blockers[0]["data_confidence"], "official_api")
+        self.assertEqual(blockers[0]["missing"], 1)
+        self.assertEqual(len(blockers[0]["secondary_sources"]), 1)
+
+    def test_action_plan_summary_collapses_manual_review_noise(self) -> None:
+        manual_entries = [
+            {
+                "id": item_id,
+                "name": name,
+                "owned": 0,
+                "needed": 1,
+                "missing": 1,
+                "category": "ambiguous/manual review",
+                "data_confidence": "manual_review_needed",
+                "paths": [f"Klobjarne Geirr > {name}"],
+            }
+            for item_id, name in enumerate(
+                [
+                    "Gift of Blood",
+                    "Gift of Bones",
+                    "Gift of Janthir Syntri",
+                    "Gift of Lowland Shore",
+                    "Gift of Glory",
+                    "Gift of War",
+                    "Gift of Battle",
+                    "Hydrocatalytic Reagent",
+                ],
+                start=100,
+            )
+        ]
+        breakdown = {
+            "target": {"name": "Klobjarne Geirr"},
+            "status": "Partially resolved",
+            "major_branches": [],
+            "terminal_missing_materials": [],
+            "account_bound_manual_source_steps": manual_entries,
+            "warnings": [],
+            "recommendations": [],
+        }
+
+        action_plan = build_action_plan_from_breakdown(breakdown)
+        summary_text = format_action_plan(action_plan)
+        detailed_text = format_action_plan(action_plan, detailed=True)
+
+        self.assertIn("Manual review summary", summary_text)
+        self.assertIn("Trophy gifts: Gift of Blood, Gift of Bones", summary_text)
+        self.assertIn("Janthir gifts: Gift of Janthir Syntri, Gift of Lowland Shore", summary_text)
+        self.assertIn("Mists/PvP/WvW gifts: Gift of Battle, Gift of Glory, Gift of War", summary_text)
+        self.assertIn("Research/currency items: Hydrocatalytic Reagent", summary_text)
+        self.assertNotIn("Manual review needed\n  - Gift of Blood", summary_text)
+        self.assertIn("Manual review needed", detailed_text)
+        self.assertIn("  - Gift of Blood:", detailed_text)
+
     def test_klobjarne_style_breakdown_has_major_branches_and_source_steps(self) -> None:
         root_id = self.root_item_id
         nyr_id = 5000

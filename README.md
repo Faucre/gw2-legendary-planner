@@ -87,6 +87,20 @@ priority blockers, do-today tasks, buy/vendor items, farm/gather items,
 crafting work, and manual review. It keeps confidence/review labels and does
 not pretend unknown costs are verified.
 
+By default, `--action-plan` is concise: it shows the top priority items,
+grouped vendor/farming summaries, and a grouped manual-review count. To see
+every action-plan entry, option detail, and path/source detail:
+
+```bash
+python gw2_legendary_planner.py --action-plan "Klobjarne Geirr" --detailed
+```
+
+To explicitly request the concise action-plan view:
+
+```bash
+python gw2_legendary_planner.py --action-plan "Klobjarne Geirr" --summary
+```
+
 To inspect acquisition options for one missing item:
 
 ```bash
