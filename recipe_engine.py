@@ -543,6 +543,7 @@ class RecipeEngine:
 
         self.raw_materials: dict[int, dict[str, Any]] = {}
         self.craftable_ingredients: dict[int, dict[str, Any]] = {}
+        self.major_components: dict[str, dict[str, Any]] = {}
         self.manual_steps: dict[str, dict[str, Any]] = {}
         self.expanded_source_steps: dict[int, dict[str, Any]] = {}
         self.satisfied_intermediates: dict[int, dict[str, Any]] = {}
@@ -1129,6 +1130,18 @@ class RecipeEngine:
                 ingredient_item_id = ingredient.get("item_id")
                 ingredient_amount = int(ingredient["amount"]) * craft_count
 
+                if depth == 0:
+                    self.add_major_component(
+                        int(ingredient_item_id) if ingredient_item_id is not None else None,
+                        ingredient.get("name") or (
+                            self.item_name(int(ingredient_item_id))
+                            if ingredient_item_id is not None
+                            else "Unnamed override ingredient"
+                        ),
+                        ingredient_amount,
+                        "override",
+                    )
+
                 if ingredient_item_id is None:
                     ingredient_name = ingredient.get("name") or "Unnamed override ingredient"
                     reason = (
@@ -1186,6 +1199,27 @@ class RecipeEngine:
             },
         )
         entry["amount"] += amount
+
+    def add_major_component(
+        self,
+        item_id: int | None,
+        name: str,
+        amount: int,
+        source: str,
+    ) -> None:
+        """Remember a direct child of the target legendary recipe."""
+
+        key = str(item_id) if item_id is not None else f"name:{normalize_item_name(name)}"
+        entry = self.major_components.setdefault(
+            key,
+            {
+                "item_id": item_id,
+                "name": name or (f"Item {item_id}" if item_id is not None else "Unnamed component"),
+                "amount": 0,
+                "source": source,
+            },
+        )
+        entry["amount"] += int(amount)
 
     def use_owned_intermediate(
         self,
@@ -1341,6 +1375,18 @@ class RecipeEngine:
             ingredient_item_id = ingredient.get("item_id")
             ingredient_amount = int(ingredient["amount"]) * craft_count
 
+            if depth == 0:
+                self.add_major_component(
+                    int(ingredient_item_id) if ingredient_item_id is not None else None,
+                    ingredient.get("name") or (
+                        self.item_name(int(ingredient_item_id))
+                        if ingredient_item_id is not None
+                        else "Unnamed wiki ingredient"
+                    ),
+                    ingredient_amount,
+                    "wiki_recipe",
+                )
+
             if ingredient_item_id is None:
                 ingredient_name = ingredient.get("name") or "Unnamed wiki ingredient"
                 reason = (
@@ -1481,6 +1527,18 @@ class RecipeEngine:
         for ingredient in resolved_ingredients:
             ingredient_item_id = ingredient.get("item_id")
             ingredient_amount = int(ingredient["amount"]) * craft_count
+
+            if depth == 0:
+                self.add_major_component(
+                    int(ingredient_item_id) if ingredient_item_id is not None else None,
+                    ingredient.get("name") or (
+                        self.item_name(int(ingredient_item_id))
+                        if ingredient_item_id is not None
+                        else "Unnamed source-step ingredient"
+                    ),
+                    ingredient_amount,
+                    "source_step_recipe",
+                )
 
             if ingredient_item_id is None:
                 ingredient_name = ingredient.get("name") or "Unnamed source-step ingredient"
@@ -2003,6 +2061,14 @@ class RecipeEngine:
                 self.add_warning(f"{item_name}: {reason}")
                 continue
 
+            if depth == 0:
+                self.add_major_component(
+                    int(ingredient_item_id),
+                    self.item_name(int(ingredient_item_id)),
+                    int(ingredient_count) * craft_count,
+                    "official_api",
+                )
+
             self.resolve_item(
                 int(ingredient_item_id),
                 int(ingredient_count) * craft_count,
@@ -2029,6 +2095,7 @@ class RecipeEngine:
 
         self.raw_materials = {}
         self.craftable_ingredients = {}
+        self.major_components = {}
         self.manual_steps = {}
         self.expanded_source_steps = {}
         self.satisfied_intermediates = {}
@@ -2065,6 +2132,10 @@ class RecipeEngine:
             "craftable_ingredients": sorted(
                 self.craftable_ingredients.values(),
                 key=lambda entry: (entry["name"], entry["item_id"]),
+            ),
+            "major_components": sorted(
+                self.major_components.values(),
+                key=lambda entry: (entry["name"], entry.get("item_id") or 0),
             ),
             "raw_material_requirements": sorted(
                 self.raw_materials.values(),

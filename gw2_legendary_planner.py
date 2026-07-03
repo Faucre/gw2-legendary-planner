@@ -3713,6 +3713,425 @@ def build_configuration_recommendations(target_status: dict[str, Any]) -> list[s
     return unique_recommendations
 
 
+def component_status_label(component: dict[str, Any]) -> str:
+    """Return a short status label for one major component."""
+
+    if component["satisfied"]:
+        return "owned"
+
+    if component["is_precursor"]:
+        return "missing precursor"
+
+    if component["manual_step"]:
+        return "source/manual step"
+
+    if component["expanded"]:
+        return "expanded"
+
+    return "missing"
+
+
+def build_major_components(
+    recipe_tree: dict[str, Any],
+    item_counts: dict[int, int],
+) -> list[dict[str, Any]]:
+    """Build user-facing major components from direct recipe children."""
+
+    expanded_ids = {
+        int(entry["item_id"])
+        for entry in recipe_tree.get("expanded_source_steps", [])
+        if entry.get("item_id") is not None
+    }
+    craftable_ids = {
+        int(entry["item_id"])
+        for entry in recipe_tree.get("craftable_ingredients", [])
+        if entry.get("item_id") is not None
+    }
+    manual_ids = {
+        int(entry["item_id"])
+        for entry in recipe_tree.get("unknown_manual_steps", [])
+        if entry.get("item_id") is not None
+    }
+    satisfied_by_id = {
+        int(entry["item_id"]): entry
+        for entry in recipe_tree.get("satisfied_intermediates", [])
+        if entry.get("item_id") is not None
+    }
+
+    components: list[dict[str, Any]] = []
+
+    for component in recipe_tree.get("major_components", []):
+        item_id = component.get("item_id")
+        item_id_int = int(item_id) if item_id is not None else None
+        needed = int(component.get("amount", 0))
+        owned = item_counts.get(item_id_int, 0) if item_id_int is not None else 0
+        satisfied_entry = satisfied_by_id.get(item_id_int) if item_id_int is not None else None
+        satisfied_amount = int(satisfied_entry.get("amount", 0)) if satisfied_entry else 0
+        missing = max(needed - max(owned, satisfied_amount), 0)
+        display_entry = {
+            "id": item_id_int or 0,
+            "name": component.get("name", "Unnamed component"),
+            "missing": missing,
+        }
+        branch = {
+            "item_id": item_id_int,
+            "name": component.get("name", "Unnamed component"),
+            "needed": needed,
+            "owned": owned,
+            "satisfied_amount": satisfied_amount,
+            "missing": missing,
+            "satisfied": satisfied_amount >= needed or (owned >= needed and needed > 0),
+            "expanded": item_id_int in expanded_ids or item_id_int in craftable_ids,
+            "manual_step": item_id_int in manual_ids,
+            "is_precursor": is_precursor_step(display_entry),
+        }
+        branch["status"] = component_status_label(branch)
+        components.append(branch)
+
+    return components
+
+
+def build_target_breakdown(
+    target: dict[str, Any],
+    wallet: dict[int, int],
+    item_counts: dict[int, int],
+    legendary_armory: dict[int, int],
+    item_names: dict[int, str],
+    currency_names: dict[int, str],
+    price_estimates: dict[int, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Create a focused planning breakdown for one target."""
+
+    target_status = build_target_status(
+        target,
+        wallet,
+        item_counts,
+        legendary_armory,
+        item_names,
+        currency_names,
+    )
+    recipe_tree = target.get(RECIPE_TREE_FIELD, {})
+    manual_steps = list(target_status["recipe_unknown_manual_steps"])
+    manual_item_ids = {
+        int(step["item_id"])
+        for step in manual_steps
+        if step.get("item_id") is not None
+    }
+    terminal_missing_materials = [
+        item
+        for item in target_status["missing_items"]
+        if int(item["id"]) not in manual_item_ids
+    ]
+    missing_by_id = {int(item["id"]): item for item in target_status["missing_items"]}
+    source_steps: list[dict[str, Any]] = []
+    source_step_ids: set[int] = set()
+
+    for step in manual_steps:
+        item_id = int(step["item_id"]) if step.get("item_id") is not None else None
+        missing_entry = missing_by_id.get(item_id) if item_id is not None else None
+        needed = int(step.get("amount", 0))
+        owned = item_counts.get(item_id, 0) if item_id is not None else 0
+        missing = (
+            missing_entry.get("missing", max(needed - owned, 0))
+            if missing_entry
+            else max(needed - owned, 0)
+        )
+
+        if missing <= 0:
+            continue
+
+        if item_id is not None:
+            source_step_ids.add(item_id)
+
+        source_steps.append(
+            {
+                **step,
+                "needed": needed,
+                "owned": missing_entry.get("owned", owned) if missing_entry else owned,
+                "missing": missing,
+            }
+        )
+
+    important_source_step_names = {
+        "gift of research",
+        "gift of the mists",
+    }
+
+    for step in recipe_tree.get("expanded_source_steps", []):
+        item_id = int(step["item_id"]) if step.get("item_id") is not None else None
+        normalized_step_name = normalize_item_name(str(step.get("name", "")))
+
+        if normalized_step_name not in important_source_step_names:
+            continue
+
+        if item_id is not None and item_id in source_step_ids:
+            continue
+
+        needed = int(step.get("amount", 0))
+        owned = item_counts.get(item_id, 0) if item_id is not None else 0
+        missing = max(needed - owned, 0)
+
+        if missing <= 0:
+            continue
+
+        if item_id is not None:
+            source_step_ids.add(item_id)
+
+        source_steps.append(
+            {
+                **step,
+                "needed": needed,
+                "owned": owned,
+                "missing": missing,
+                "reason": "Expanded source-step component; review its acquisition path.",
+            }
+        )
+
+    recommendations = build_gameplay_recommendations(target_status, price_estimates)
+    recommendations.extend(build_configuration_recommendations(target_status)[:2])
+
+    source_step_names = {normalize_item_name(str(step.get("name", ""))) for step in source_steps}
+
+    if "gift of research" in source_step_names:
+        recommendations.append(
+            "Source step: Gift of Research needs research notes; review that branch before buying."
+        )
+
+    if "gift of the mists" in source_step_names:
+        recommendations.append("Source step: Gift of the Mists is still needed; review that branch.")
+
+    unique_recommendations: list[str] = []
+
+    for recommendation in recommendations:
+        if recommendation not in unique_recommendations:
+            unique_recommendations.append(recommendation)
+
+    final_item_id = target_final_item_id(target)
+    owned_final = []
+
+    if final_item_id is not None and is_target_unlocked(target, legendary_armory):
+        owned_final.append(
+            {
+                "item_id": final_item_id,
+                "name": item_names.get(
+                    final_item_id,
+                    target.get("final_item_name", target_status["name"]),
+                ),
+                "source": "Legendary Armory",
+            }
+        )
+
+    return {
+        "target": {
+            "name": target_status["name"],
+            "final_item_id": final_item_id,
+            "final_item_name": target.get("final_item_name", target_status["name"]),
+        },
+        "status": target_status["status_label"],
+        "owned_final_items": owned_final,
+        "owned_intermediate_items": list(recipe_tree.get("satisfied_intermediates", [])),
+        "major_branches": build_major_components(recipe_tree, item_counts),
+        "expanded_ingredients": list(recipe_tree.get("expanded_source_steps", [])),
+        "terminal_missing_materials": terminal_missing_materials,
+        "account_bound_manual_source_steps": source_steps,
+        "warnings": list(target_status["recipe_engine_warnings"]),
+        "recommendations": unique_recommendations,
+    }
+
+
+def format_breakdown_entry_amount(entry: dict[str, Any]) -> str:
+    """Format have/need/missing counts for one breakdown line."""
+
+    owned = int(entry.get("owned", 0))
+    needed = int(entry.get("needed", entry.get("amount", 0)))
+    missing = int(entry.get("missing", max(needed - owned, 0)))
+    return f"have {owned:,}, need {needed:,}, missing {missing:,}"
+
+
+def format_target_breakdown(breakdown: dict[str, Any]) -> str:
+    """Turn a target breakdown dictionary into readable CLI text."""
+
+    target = breakdown["target"]
+    lines = [
+        "Legendary Breakdown",
+        "===================",
+        f"Target: {target['name']}",
+    ]
+
+    if target.get("final_item_id"):
+        lines.append(
+            f"Final item: {target.get('final_item_name') or target['name']} "
+            f"(item_id {target['final_item_id']})"
+        )
+
+    lines.extend(["", "Status", f"  - {breakdown['status']}"])
+    lines.extend(["", "Already owned / satisfied"])
+
+    owned_lines = []
+
+    for item in breakdown["owned_final_items"]:
+        owned_lines.append(f"  - {item['name']}: already unlocked via {item['source']}.")
+
+    for item in breakdown["owned_intermediate_items"]:
+        owned_lines.append(
+            f"  - {item['name']}: have {int(item['amount']):,}, branch satisfied."
+        )
+
+    lines.extend(owned_lines or ["  - None found for this target yet."])
+    lines.extend(["", "Major components"])
+
+    if breakdown["major_branches"]:
+        for component in breakdown["major_branches"]:
+            lines.append(
+                f"  - {component['name']}: {component['status']} "
+                f"({format_breakdown_entry_amount(component)})"
+            )
+    else:
+        lines.append("  - No major components were resolved yet.")
+
+    expanded_by_id = {
+        int(component["item_id"]): component
+        for component in breakdown["expanded_ingredients"]
+        if component.get("item_id") is not None
+    }
+    expanded_major_branches = [
+        component
+        for component in breakdown["major_branches"]
+        if component["expanded"] and component.get("item_id") in expanded_by_id
+    ]
+
+    if expanded_major_branches:
+        lines.extend(["", "Expanded components"])
+
+        for branch in expanded_major_branches:
+            expanded_component = expanded_by_id[int(branch["item_id"])]
+            lines.append(
+                f"  - {branch['name']}: expanded into "
+                f"{int(expanded_component.get('ingredient_count', 0)):,} child ingredients."
+            )
+
+        nested_count = max(len(breakdown["expanded_ingredients"]) - len(expanded_major_branches), 0)
+
+        if nested_count:
+            lines.append(f"  - {nested_count:,} nested components also expanded.")
+
+    lines.extend(["", "Missing materials"])
+
+    if breakdown["terminal_missing_materials"]:
+        for item in breakdown["terminal_missing_materials"]:
+            lines.append(f"  - {item['name']}: {format_breakdown_entry_amount(item)}")
+    else:
+        lines.append("  - No terminal materials missing after owned items were counted.")
+
+    lines.extend(["", "Manual/source steps"])
+
+    if breakdown["account_bound_manual_source_steps"]:
+        for step in breakdown["account_bound_manual_source_steps"]:
+            lines.append(f"  - {step['name']}: {format_breakdown_entry_amount(step)}")
+            source_summary = str(
+                step.get("source_step_summary") or step.get("source_summary") or ""
+            ).strip()
+
+            if source_summary:
+                lines.append(f"    Summary: {source_summary}")
+
+            if step.get("source_url"):
+                lines.append(f"    Source URL: {step['source_url']}")
+    else:
+        lines.append("  - No manual/source steps currently blocking this target.")
+
+    lines.extend(["", "Recommended next actions"])
+
+    if breakdown["recommendations"]:
+        for recommendation in breakdown["recommendations"][:6]:
+            lines.append(f"  - {recommendation}")
+    else:
+        lines.append(
+            "  - No specific recommendation matched yet; work the first missing major component."
+        )
+
+    lines.extend(["", "Warnings / needs review"])
+
+    if breakdown["warnings"]:
+        for warning in breakdown["warnings"][:8]:
+            lines.append(f"  - {warning}")
+    else:
+        lines.append("  - No recipe warnings for this breakdown.")
+
+    return "\n".join(lines).rstrip()
+
+
+def select_breakdown_target(
+    targets: list[dict[str, Any]],
+    target_name: str | None = None,
+    use_priority: bool = False,
+) -> dict[str, Any]:
+    """Choose the target for a focused breakdown command."""
+
+    enabled_targets = [target for target in targets if target.get("enabled", True)]
+
+    if use_priority:
+        if not enabled_targets:
+            raise ValueError("No enabled targets were found in legendary_goals.json.")
+
+        return enabled_targets[0]
+
+    if not target_name:
+        raise ValueError("Pass --breakdown \"Target Name\" or use --breakdown-priority.")
+
+    normalized_requested_name = normalize_item_name(target_name)
+    matches = [
+        target
+        for target in enabled_targets
+        if normalize_item_name(str(target.get("name", ""))) == normalized_requested_name
+        or normalize_item_name(str(target.get("final_item_name", "")))
+        == normalized_requested_name
+    ]
+
+    if len(matches) == 1:
+        return matches[0]
+
+    if not matches:
+        available_names = ", ".join(
+            str(target.get("name", "Unnamed target")) for target in enabled_targets
+        )
+        raise ValueError(
+            f"No enabled target named '{target_name}' was found. "
+            f"Enabled targets: {available_names or 'none'}."
+        )
+
+    raise ValueError(f"More than one enabled target matched '{target_name}'.")
+
+
+def build_breakdown_report(
+    targets: list[dict[str, Any]],
+    wallet: dict[int, int],
+    item_counts: dict[int, int],
+    legendary_armory: dict[int, int],
+    item_names: dict[int, str],
+    currency_names: dict[int, str],
+    target_name: str | None = None,
+    use_priority: bool = False,
+) -> str:
+    """Build the focused CLI Legendary Breakdown v1 output."""
+
+    target = select_breakdown_target(
+        targets,
+        target_name=target_name,
+        use_priority=use_priority,
+    )
+    breakdown = build_target_breakdown(
+        target,
+        wallet,
+        item_counts,
+        legendary_armory,
+        item_names,
+        currency_names,
+        price_estimates=None,
+    )
+    return format_target_breakdown(breakdown)
+
+
 def add_recommended_today_section(
     lines: list[str],
     targets: list[dict[str, Any]],
@@ -4002,6 +4421,16 @@ def parse_args() -> argparse.Namespace:
         help="Optional path for saving the report as a text file.",
     )
     parser.add_argument(
+        "--breakdown",
+        default=None,
+        help="Show a focused legendary breakdown for one enabled target name.",
+    )
+    parser.add_argument(
+        "--breakdown-priority",
+        action="store_true",
+        help="Show a focused breakdown for the first enabled target in priority order.",
+    )
+    parser.add_argument(
         "--validate-goals",
         action="store_true",
         help="Validate goal/template configuration without scanning the account.",
@@ -4246,6 +4675,37 @@ def main() -> int:
         )
 
         item_ids, currency_ids = collect_goal_ids(targets)
+        item_names = fetch_item_names_from_reference(item_ids) if item_ids else {}
+
+        if item_ids - set(item_names):
+            missing_name_ids = item_ids - set(item_names)
+            fetched_item_names = fetch_names("/items", missing_name_ids)
+            item_names.update(fetched_item_names)
+
+        currency_names = fetch_names("/currencies", currency_ids) if currency_ids else {}
+
+        if args.breakdown or args.breakdown_priority:
+            report = build_breakdown_report(
+                targets,
+                wallet,
+                item_counts,
+                legendary_armory,
+                item_names,
+                currency_names,
+                target_name=args.breakdown,
+                use_priority=args.breakdown_priority,
+            )
+            print(report)
+
+            if args.output:
+                output_path = Path(args.output)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_text(report + "\n", encoding="utf-8")
+                print()
+                print(f"Report saved to {output_path}")
+
+            return 0
+
         price_estimates = None
 
         if args.no_prices:
@@ -4258,15 +4718,6 @@ def main() -> int:
                 recipe_engine,
             )
             price_estimates = get_price_estimates(missing_item_ids, DEFAULT_PRICE_CACHE_PATH)
-
-        item_names = fetch_item_names_from_reference(item_ids) if item_ids else {}
-
-        if item_ids - set(item_names):
-            missing_name_ids = item_ids - set(item_names)
-            fetched_item_names = fetch_names("/items", missing_name_ids)
-            item_names.update(fetched_item_names)
-
-        currency_names = fetch_names("/currencies", currency_ids) if currency_ids else {}
 
         report = build_report(
             targets,

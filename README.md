@@ -37,6 +37,23 @@ python gw2_legendary_planner.py
 
 By default, the report uses a clean summary format: scan summary, `Recommended today`, and each enabled target in priority order.
 
+For the focused CLI Legendary Breakdown v1 view:
+
+```bash
+python gw2_legendary_planner.py --breakdown "Klobjarne Geirr"
+```
+
+To break down the first enabled target in `legendary_goals.json` priority order:
+
+```bash
+python gw2_legendary_planner.py --breakdown-priority
+```
+
+The breakdown view shows the target, status, owned/satisfied intermediates,
+major components, expanded components, missing materials, manual/source steps,
+recommended next actions, and warnings. It uses owned intermediate items first
+unless you also pass `--raw-materials`.
+
 To also show completed entries:
 
 ```bash

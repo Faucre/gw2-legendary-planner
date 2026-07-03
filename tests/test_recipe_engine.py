@@ -13,7 +13,9 @@ from gw2_legendary_planner import (
     RECIPE_TREE_FIELD,
     RECIPE_UNKNOWN_STEPS_FIELD,
     build_rule_recommendations,
+    build_target_breakdown,
     build_target_status,
+    format_target_breakdown,
     make_recipe_engine_lines,
     recipe_tree_to_material_entries,
 )
@@ -884,6 +886,158 @@ class RecipeEngineWikiFallbackTests(unittest.TestCase):
         self.assertIn("research notes", recommendation_text)
         self.assertIn("Source step: Gift of the Mists", recommendation_text)
         self.assertIn("Precursor step: Nyr Hrammr", recommendation_text)
+
+    def test_klobjarne_style_breakdown_has_major_branches_and_source_steps(self) -> None:
+        root_id = self.root_item_id
+        nyr_id = 5000
+        janthir_id = 5001
+        klobjarne_gift_id = 5002
+        homesteader_id = 5003
+        bloodstone_id = 5004
+        gatherer_id = 5005
+        runestone_id = 5006
+        mists_id = 5007
+        research_id = 5008
+        clover_id = 5009
+
+        connection = self.reference_database.connect()
+        try:
+            insert_item(connection, nyr_id, "Nyr Hrammr")
+            insert_item(connection, janthir_id, "Gift of Janthir Wilds", flags=["AccountBound"])
+            insert_item(connection, klobjarne_gift_id, "Gift of Klobjarne Geirr", flags=["AccountBound"])
+            insert_item(connection, homesteader_id, "Gift of the Homesteader", flags=["AccountBound"])
+            insert_item(connection, bloodstone_id, "Bloodstone Shard", flags=["AccountBound"])
+            insert_item(connection, gatherer_id, "Gift of Gatherer of the Hunt", flags=["AccountBound"])
+            insert_item(connection, runestone_id, "Mystic Runestone", flags=["AccountBound"])
+            insert_item(connection, mists_id, "Gift of the Mists", flags=["AccountBound"])
+            insert_item(connection, research_id, "Gift of Research", flags=["AccountBound"])
+            insert_item(connection, clover_id, "Mystic Clover")
+            insert_wiki_recipe(
+                connection,
+                root_id,
+                self.root_item_name,
+                "\n".join(
+                    [
+                        "== Acquisition ==",
+                        "=== Recipe ===",
+                        "{{Recipe",
+                        "| source = Mystic Forge",
+                        "| ingredient1 = 1 Nyr Hrammr",
+                        "| ingredient2 = 1 Gift of Janthir Wilds",
+                        "| ingredient3 = 1 Gift of Klobjarne Geirr",
+                        "| ingredient4 = 1 Gift of the Homesteader",
+                        "}}",
+                    ]
+                ),
+                source_url=self.source_url,
+            )
+            insert_wiki_recipe(
+                connection,
+                janthir_id,
+                "Gift of Janthir Wilds",
+                "\n".join(
+                    [
+                        "{{Recipe",
+                        "| source = Mystic Forge",
+                        "| ingredient1 = 1 Gift of Gatherer of the Hunt",
+                        "| ingredient2 = 1 Bloodstone Shard",
+                        "}}",
+                    ]
+                ),
+            )
+            insert_wiki_recipe(
+                connection,
+                klobjarne_gift_id,
+                "Gift of Klobjarne Geirr",
+                "\n".join(
+                    [
+                        "{{Recipe",
+                        "| source = Mystic Forge",
+                        "| ingredient1 = 100 Mystic Runestone",
+                        "| ingredient2 = 1 Gift of the Mists",
+                        "| ingredient3 = 1 Gift of Research",
+                        "}}",
+                    ]
+                ),
+            )
+            insert_wiki_recipe(
+                connection,
+                homesteader_id,
+                "Gift of the Homesteader",
+                "\n".join(
+                    [
+                        "{{Recipe",
+                        "| source = Mystic Forge",
+                        "| ingredient1 = 38 Mystic Clovers",
+                        "}}",
+                    ]
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        self.write_overrides(
+            [
+                {
+                    "item_id": root_id,
+                    "name": self.root_item_name,
+                    "type": "mystic_forge",
+                    "verified": False,
+                    "ingredients": [],
+                }
+            ]
+        )
+
+        item_counts = {
+            clover_id: 8,
+            runestone_id: 20,
+        }
+        engine = self.make_engine()
+        tree = engine.resolve_recipe_tree(root_id, item_counts=item_counts)
+        target = {
+            "name": "Klobjarne Geirr",
+            "final_item_id": root_id,
+            "final_item_name": self.root_item_name,
+            "materials": [],
+            "currencies": [],
+            "steps": [],
+            AUTO_RECIPE_MATERIALS_FIELD: recipe_tree_to_material_entries(tree),
+            RECIPE_TREE_FIELD: tree,
+            RECIPE_UNKNOWN_STEPS_FIELD: tree["unknown_manual_steps"],
+            RECIPE_ENGINE_WARNINGS_FIELD: tree["warnings"],
+        }
+        breakdown = build_target_breakdown(
+            target,
+            wallet={},
+            item_counts=item_counts,
+            legendary_armory={},
+            item_names={},
+            currency_names={},
+        )
+        text = format_target_breakdown(breakdown)
+
+        major_branch_names = {branch["name"] for branch in breakdown["major_branches"]}
+        self.assertEqual(
+            major_branch_names,
+            {
+                "Nyr Hrammr",
+                "Gift of Janthir Wilds",
+                "Gift of Klobjarne Geirr",
+                "Gift of the Homesteader",
+            },
+        )
+        self.assertIn("Nyr Hrammr: missing precursor", text)
+        self.assertIn("Gift of Janthir Wilds: expanded", text)
+        self.assertIn("Gift of Klobjarne Geirr: expanded", text)
+        self.assertIn("Gift of the Homesteader: expanded", text)
+        self.assertIn("Mystic Clover: have 8, need 38, missing 30", text)
+        self.assertIn("Mystic Runestone: have 20, need 100, missing 80", text)
+        self.assertIn("Bloodstone Shard", text)
+        self.assertIn("Gift of Research", text)
+        self.assertIn("Gift of the Mists", text)
+        self.assertIn("Recommended next actions", text)
+        self.assertIn("Mystic Clover: do Wizard's Vault", text)
 
 
 if __name__ == "__main__":
