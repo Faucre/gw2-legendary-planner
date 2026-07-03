@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -17,7 +18,11 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from reference_database import DEFAULT_REFERENCE_DB_PATH, ReferenceDatabase
+from reference_database import (
+    DEFAULT_REFERENCE_DB_PATH,
+    ReferenceDatabase,
+    normalize_wiki_item_text,
+)
 
 
 API_BASE_URL = "https://api.guildwars2.com/v2"
@@ -58,6 +63,10 @@ NON_PRICEABLE_OVERRIDE_TYPES = {
     "vendor",
     "time_gated",
     "account_bound",
+}
+
+WIKI_STUB_CONTINUE_OVERRIDE_TYPES = {
+    "mystic_forge",
 }
 
 
@@ -178,6 +187,108 @@ def normalize_item_name(item_name: str) -> str:
     """Make item names easier to compare by ignoring case and extra spaces."""
 
     return " ".join(item_name.casefold().split())
+
+
+def parse_wiki_ingredient_text(ingredient_text: str) -> dict[str, Any] | None:
+    """Parse a simple wiki recipe ingredient line like '1 Gift of Battle'."""
+
+    original_text = str(ingredient_text).strip()
+    clean_text = " ".join(original_text.replace("\xa0", " ").split())
+
+    if not clean_text:
+        return None
+
+    match = re.match(r"^(?P<amount>\d[\d,]*)\s+(?P<name>.+)$", clean_text)
+
+    if not match:
+        return None
+
+    name_details = normalize_wiki_item_text(match.group("name").strip())
+
+    return {
+        "amount": int(match.group("amount").replace(",", "")),
+        "name": name_details["normalized_name"],
+        "original_wiki_text": original_text,
+        "original_wiki_name": match.group("name").strip(),
+        "wiki_page_title": name_details["page_title"],
+        "wiki_display_text": name_details["display_text"],
+        "wiki_name_candidates": name_details["candidates"],
+    }
+
+
+def extract_wiki_recipe_templates(wikitext: str) -> list[dict[str, Any]]:
+    """Extract simple {{Recipe ...}} templates from stored wiki wikitext."""
+
+    recipe_blocks: list[str] = []
+    current_block: list[str] = []
+    inside_recipe = False
+    brace_balance = 0
+
+    for raw_line in wikitext.splitlines():
+        line = raw_line.strip()
+
+        if not inside_recipe and line.startswith("{{Recipe"):
+            inside_recipe = True
+            current_block = [line]
+            brace_balance = line.count("{{") - line.count("}}")
+
+            if brace_balance <= 0:
+                recipe_blocks.append("\n".join(current_block))
+                inside_recipe = False
+
+            continue
+
+        if not inside_recipe:
+            continue
+
+        current_block.append(line)
+        brace_balance += line.count("{{") - line.count("}}")
+
+        if brace_balance <= 0:
+            recipe_blocks.append("\n".join(current_block))
+            inside_recipe = False
+
+    parsed_recipes: list[dict[str, Any]] = []
+
+    for block in recipe_blocks:
+        fields: dict[str, str] = {}
+
+        for raw_line in block.splitlines():
+            line = raw_line.strip()
+
+            if not line.startswith("|"):
+                continue
+
+            key, separator, value = line[1:].partition("=")
+
+            if not separator:
+                continue
+
+            fields[key.strip().casefold()] = value.strip()
+
+        ingredients: list[dict[str, Any]] = []
+
+        for key in sorted(fields):
+            if not re.fullmatch(r"ingredient\d+", key):
+                continue
+
+            parsed_ingredient = parse_wiki_ingredient_text(fields[key])
+
+            if parsed_ingredient:
+                ingredients.append(parsed_ingredient)
+
+        if not ingredients:
+            continue
+
+        parsed_recipes.append(
+            {
+                "source_hint": fields.get("source", "").strip(),
+                "ingredients": ingredients,
+                "raw_template": block,
+            }
+        )
+
+    return parsed_recipes
 
 
 def empty_recipe_overrides() -> dict[str, Any]:
@@ -403,6 +514,8 @@ class RecipeEngine:
         self.craftable_ingredients: dict[int, dict[str, Any]] = {}
         self.manual_steps: dict[str, dict[str, Any]] = {}
         self.recipes_used: dict[int, dict[str, Any]] = {}
+        self.resolution_log: dict[int, dict[str, Any]] = {}
+        self.wiki_sources_used: dict[int, dict[str, Any]] = {}
         self.warnings: list[str] = []
 
     def save_cache(self) -> None:
@@ -559,6 +672,333 @@ class RecipeEngine:
         override = self.override_for_item(item_id, item_name)
         return bool(override and override_is_non_priceable(override))
 
+    def override_decision_for_item(
+        self,
+        item_id: int,
+        item_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Classify how one override should affect recipe resolution."""
+
+        override = self.override_for_item(item_id, item_name)
+
+        if not override:
+            return {
+                "status": "none",
+                "reason": "No matching override found.",
+                "override": None,
+            }
+
+        override_type = str(override.get("type", "manual")).casefold()
+        ingredients = list(override.get("ingredients", []))
+        verified = bool(override.get("verified", False))
+
+        if ingredients and verified:
+            return {
+                "status": "verified_ingredients",
+                "reason": (
+                    f"Override '{override_type}' has verified ingredients and takes priority."
+                ),
+                "override": override,
+                "override_type": override_type,
+            }
+
+        if ingredients:
+            return {
+                "status": "unverified_ingredients",
+                "reason": (
+                    f"Override '{override_type}' includes ingredients, but verified is false, "
+                    "so automatic resolution continues to safer sources."
+                ),
+                "override": override,
+                "override_type": override_type,
+            }
+
+        if verified or override_type not in WIKI_STUB_CONTINUE_OVERRIDE_TYPES:
+            return {
+                "status": "manual_stop",
+                "reason": (
+                    f"Override '{override_type}' has no ingredients and is treated as an "
+                    "intentional manual stop."
+                ),
+                "override": override,
+                "override_type": override_type,
+            }
+
+        return {
+            "status": "stub_continue",
+            "reason": (
+                f"Override '{override_type}' is an unverified empty stub, so automatic "
+                "resolution continues to imported wiki data."
+            ),
+            "override": override,
+            "override_type": override_type,
+        }
+
+    def official_recipe_lookup_summary(self, item_id: int) -> dict[str, Any]:
+        """Summarize official recipe lookup results for one item."""
+
+        try:
+            recipe_ids = self.recipe_ids_for_output(item_id)
+        except RecipeApiError as error:
+            return {
+                "status": "lookup_failed",
+                "recipe_ids": [],
+                "reason": f"Official recipe lookup failed: {error}",
+                "error": str(error),
+            }
+
+        if not recipe_ids:
+            return {
+                "status": "no_recipe",
+                "recipe_ids": [],
+                "reason": "The official API has no recipe that outputs this item.",
+            }
+
+        if len(recipe_ids) == 1:
+            return {
+                "status": "single_recipe",
+                "recipe_ids": list(recipe_ids),
+                "recipe_id": recipe_ids[0],
+                "reason": f"One official recipe was found: {recipe_ids[0]}.",
+            }
+
+        preferred_recipe_id = self.preferred_recipes_by_output.get(item_id)
+
+        if preferred_recipe_id in recipe_ids:
+            return {
+                "status": "preferred_recipe",
+                "recipe_ids": list(recipe_ids),
+                "recipe_id": preferred_recipe_id,
+                "reason": (
+                    f"Multiple official recipes were found; preferred recipe "
+                    f"{preferred_recipe_id} is configured."
+                ),
+            }
+
+        recipe_text = ", ".join(str(recipe_id) for recipe_id in recipe_ids)
+        return {
+            "status": "multiple_recipes",
+            "recipe_ids": list(recipe_ids),
+            "reason": (
+                "Multiple official recipes were found and no valid preferred recipe is "
+                f"configured. Recipe IDs: {recipe_text}"
+            ),
+        }
+
+    def resolve_wiki_ingredients(
+        self,
+        ingredients: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        """Resolve imported wiki ingredient names to item IDs when possible."""
+
+        resolved_ingredients: list[dict[str, Any]] = []
+        issues: list[str] = []
+
+        for ingredient in ingredients:
+            ingredient_name = str(ingredient.get("name", "")).strip()
+            candidate_names = [
+                str(candidate).strip()
+                for candidate in ingredient.get("wiki_name_candidates", [ingredient_name])
+                if str(candidate).strip()
+            ]
+            resolved_ingredient = {
+                "amount": int(ingredient["amount"]),
+                "name": ingredient_name or "Unnamed wiki ingredient",
+                "original_wiki_text": ingredient.get("original_wiki_text", ""),
+                "original_wiki_name": ingredient.get("original_wiki_name", ""),
+                "wiki_page_title": ingredient.get("wiki_page_title", ""),
+                "wiki_display_text": ingredient.get("wiki_display_text", ""),
+            }
+
+            if self.using_reference_database and candidate_names:
+                chosen_matches: list[dict[str, Any]] = []
+                ambiguous_candidates: list[str] = []
+
+                for candidate_name in candidate_names:
+                    matches = self.reference_database.item_name_matches(candidate_name)
+
+                    if len(matches) == 1:
+                        chosen_matches = matches
+                        resolved_ingredient["name"] = matches[0].get("name", candidate_name)
+                        break
+
+                    if len(matches) > 1:
+                        ambiguous_candidates.append(candidate_name)
+
+                if chosen_matches:
+                    resolved_ingredient["item_id"] = int(chosen_matches[0]["item_id"])
+                elif ambiguous_candidates:
+                    issues.append(
+                        "Imported GW2 Wiki ingredient "
+                        f"'{ingredient.get('original_wiki_name', ingredient_name)}' is "
+                        "ambiguous in the reference database. Add a verified override before "
+                        "relying on it."
+                    )
+                else:
+                    issues.append(
+                        "Imported GW2 Wiki ingredient "
+                        f"'{ingredient.get('original_wiki_name', ingredient_name)}' was not "
+                        "found in the reference database."
+                    )
+
+            resolved_ingredients.append(resolved_ingredient)
+
+        return resolved_ingredients, issues
+
+    def wiki_recipe_summary_for_item(
+        self,
+        item_id: int,
+        item_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Summarize imported wiki recipe data for one item."""
+
+        resolved_name = item_name or self.item_name(item_id)
+        summary: dict[str, Any] = {
+            "item_id": item_id,
+            "name": resolved_name,
+            "rows": [],
+            "row_count": 0,
+            "acquisition_options": [],
+            "acquisition_option_count": 0,
+            "multiple_acquisition_options": False,
+            "recipe_option_count": 0,
+            "parsed_recipes": [],
+            "parsed_recipe_count": 0,
+            "selected_recipe": None,
+            "resolved_ingredients": [],
+            "ingredient_issues": [],
+            "source_url": "",
+            "review_status": "",
+            "reason": "No imported wiki recipe rows found.",
+        }
+
+        if not self.using_reference_database:
+            summary["reason"] = "The local reference database is not available."
+            return summary
+
+        rows = self.reference_database.wiki_recipes_for_output(item_id)
+        options = self.reference_database.acquisition_options_for_item(item_id)
+        parsed_recipes: list[dict[str, Any]] = []
+
+        for row in rows:
+            raw_payload = row.get("raw_json", {})
+            wikitext = str(raw_payload.get("wikitext", ""))
+
+            for parsed_recipe in extract_wiki_recipe_templates(wikitext):
+                parsed_recipes.append(
+                    {
+                        **parsed_recipe,
+                        "source_url": row["source_url"],
+                        "review_status": row["review_status"],
+                        "name": row.get("name") or resolved_name,
+                    }
+                )
+
+        recipe_option_count = sum(
+            1
+            for option in options
+            if str(option.get("acquisition_type", "")).casefold() == "recipe"
+        )
+        primary_row = rows[0] if rows else None
+
+        summary.update(
+            {
+                "rows": rows,
+                "row_count": len(rows),
+                "acquisition_options": options,
+                "acquisition_option_count": len(options),
+                "multiple_acquisition_options": len(options) > 1,
+                "recipe_option_count": recipe_option_count,
+                "parsed_recipes": parsed_recipes,
+                "parsed_recipe_count": len(parsed_recipes),
+                "source_url": primary_row.get("source_url", "") if primary_row else "",
+                "review_status": primary_row.get("review_status", "") if primary_row else "",
+            }
+        )
+
+        if not rows:
+            return summary
+
+        if not parsed_recipes:
+            summary["reason"] = (
+                "Imported GW2 Wiki data exists, but no usable {{Recipe}} ingredient block "
+                "was parsed from it."
+            )
+            return summary
+
+        if len(parsed_recipes) > 1:
+            summary["reason"] = (
+                "Imported GW2 Wiki data contains multiple recipe templates, so a manual "
+                "choice is still needed."
+            )
+            return summary
+
+        if len(options) > 1 and recipe_option_count != 1:
+            summary["reason"] = (
+                "Imported GW2 Wiki data has multiple acquisition options and no single "
+                "recipe option is clearly marked as the default."
+            )
+            return summary
+
+        selected_recipe = parsed_recipes[0]
+        resolved_ingredients, ingredient_issues = self.resolve_wiki_ingredients(
+            selected_recipe["ingredients"]
+        )
+        summary["selected_recipe"] = selected_recipe
+        summary["resolved_ingredients"] = resolved_ingredients
+        summary["ingredient_issues"] = ingredient_issues
+
+        if len(options) > 1 and recipe_option_count == 1:
+            summary["reason"] = (
+                "Imported GW2 Wiki data has multiple acquisition options, but exactly one "
+                "recipe option is clearly marked."
+            )
+        else:
+            summary["reason"] = "One imported GW2 Wiki recipe template was found."
+
+        return summary
+
+    def record_resolution(
+        self,
+        item_id: int,
+        source: str,
+        reason: str,
+        **metadata: Any,
+    ) -> None:
+        """Record which source was chosen for one item."""
+
+        self.resolution_log[item_id] = {
+            "item_id": item_id,
+            "name": self.item_name(item_id),
+            "source": source,
+            "reason": reason,
+            **metadata,
+        }
+
+    def record_wiki_source_usage(
+        self,
+        item_id: int,
+        item_name: str,
+        wiki_summary: dict[str, Any],
+        used_for_recipe: bool,
+        selection_reason: str,
+    ) -> None:
+        """Track wiki source metadata so reports can show it cleanly."""
+
+        self.wiki_sources_used[item_id] = {
+            "item_id": item_id,
+            "name": item_name,
+            "source": "GW2 Wiki",
+            "review_status": wiki_summary.get("review_status", ""),
+            "source_url": wiki_summary.get("source_url", ""),
+            "acquisition_option_count": int(wiki_summary.get("acquisition_option_count", 0)),
+            "multiple_acquisition_options": bool(
+                wiki_summary.get("multiple_acquisition_options", False)
+            ),
+            "used_for_recipe": used_for_recipe,
+            "selection_reason": selection_reason,
+        }
+
     def apply_override(
         self,
         item_id: int,
@@ -660,10 +1100,98 @@ class RecipeEngine:
                 "amount": 0,
                 "recipe_id": recipe_id,
                 "craft_count": 0,
+                "recipe_source": "official_api",
+                "review_status": "",
+                "source_url": "",
             },
         )
         entry["amount"] += amount
         entry["craft_count"] += craft_count
+
+    def apply_wiki_recipe(
+        self,
+        item_id: int,
+        amount: int,
+        wiki_summary: dict[str, Any],
+        current_path: list[int],
+        active_item_ids: set[int],
+        depth: int,
+        max_depth: int,
+    ) -> None:
+        """Apply one imported wiki recipe template as an unreviewed fallback."""
+
+        item_name = self.item_name(item_id)
+        resolved_ingredients = list(wiki_summary.get("resolved_ingredients", []))
+        selection_reason = str(wiki_summary.get("reason", ""))
+
+        self.record_resolution(
+            item_id,
+            "wiki_recipe",
+            selection_reason
+            or "Imported GW2 Wiki recipe data was used because no official recipe was found.",
+            source_url=wiki_summary.get("source_url", ""),
+            review_status=wiki_summary.get("review_status", ""),
+            acquisition_option_count=int(wiki_summary.get("acquisition_option_count", 0)),
+            multiple_acquisition_options=bool(
+                wiki_summary.get("multiple_acquisition_options", False)
+            ),
+        )
+        self.record_wiki_source_usage(
+            item_id,
+            item_name,
+            wiki_summary,
+            used_for_recipe=True,
+            selection_reason=selection_reason,
+        )
+
+        for issue in wiki_summary.get("ingredient_issues", []):
+            self.add_warning(f"{item_name}: {issue}")
+
+        if depth > 0:
+            self.craftable_ingredients.setdefault(
+                item_id,
+                {
+                    "item_id": item_id,
+                    "name": item_name,
+                    "amount": 0,
+                    "recipe_id": None,
+                    "craft_count": 0,
+                    "recipe_source": "wiki",
+                    "review_status": wiki_summary.get("review_status", ""),
+                    "source_url": wiki_summary.get("source_url", ""),
+                },
+            )
+            self.craftable_ingredients[item_id]["amount"] += amount
+            self.craftable_ingredients[item_id]["craft_count"] += amount
+
+        craft_count = max(int(amount), 1)
+
+        next_active_item_ids = set(active_item_ids)
+        next_active_item_ids.add(item_id)
+
+        for ingredient in resolved_ingredients:
+            ingredient_item_id = ingredient.get("item_id")
+            ingredient_amount = int(ingredient["amount"]) * craft_count
+
+            if ingredient_item_id is None:
+                ingredient_name = ingredient.get("name") or "Unnamed wiki ingredient"
+                reason = (
+                    f"Imported GW2 Wiki recipe data for {item_name} includes "
+                    f"'{ingredient_name}' by name only. Add a verified override before "
+                    "the app can resolve it safely."
+                )
+                self.add_manual_step(item_id, amount, reason, current_path)
+                self.add_warning(reason)
+                continue
+
+            self.resolve_item(
+                int(ingredient_item_id),
+                ingredient_amount,
+                depth + 1,
+                current_path,
+                next_active_item_ids,
+                max_depth,
+            )
 
     def add_manual_step(
         self,
@@ -760,6 +1288,7 @@ class RecipeEngine:
             )
             self.add_manual_step(item_id, amount, reason, item_path)
             self.add_warning(f"{item_name}: {reason}")
+            self.record_resolution(item_id, "manual_recipe_gap", reason)
             return
 
         try:
@@ -771,6 +1300,7 @@ class RecipeEngine:
             )
             self.add_manual_step(item_id, amount, reason, item_path)
             self.add_warning(f"{item_name}: {reason}")
+            self.record_resolution(item_id, "manual_recipe_gap", reason)
             return
 
         if item_has_account_bound_flags(item):
@@ -780,12 +1310,19 @@ class RecipeEngine:
             )
             self.add_manual_step(item_id, amount, reason, item_path)
             self.add_warning(f"{item_name}: {reason}")
+            self.record_resolution(item_id, "account_bound_manual_stop", reason)
             return
 
         self.add_raw_material(
             item_id,
             amount,
             "No official recipe found; treat as a terminal material.",
+        )
+        self.record_resolution(
+            item_id,
+            "terminal_material",
+            "No official recipe or usable wiki recipe was found, so this item is treated "
+            "as a terminal material.",
         )
 
     def resolve_item(
@@ -809,6 +1346,7 @@ class RecipeEngine:
             )
             self.add_manual_step(item_id, amount, reason, current_path)
             self.add_warning(f"{item_name}: {reason} Path: {self.format_item_path(current_path)}")
+            self.record_resolution(item_id, "manual_cycle_stop", reason)
             return
 
         if depth >= max_depth:
@@ -818,11 +1356,37 @@ class RecipeEngine:
             )
             self.add_manual_step(item_id, amount, reason, current_path)
             self.add_warning(f"{item_name}: {reason}")
+            self.record_resolution(item_id, "manual_max_depth_stop", reason)
             return
 
-        override = self.override_for_item(item_id, item_name)
+        override_decision = self.override_decision_for_item(item_id, item_name)
+        override = override_decision.get("override")
 
-        if override:
+        if override_decision["status"] == "verified_ingredients":
+            self.record_resolution(
+                item_id,
+                "override_verified_ingredients",
+                override_decision["reason"],
+                override_type=override_decision.get("override_type", ""),
+            )
+            self.apply_override(
+                item_id,
+                amount,
+                override,
+                current_path,
+                active_item_ids,
+                depth,
+                max_depth,
+            )
+            return
+
+        if override_decision["status"] == "manual_stop":
+            self.record_resolution(
+                item_id,
+                "override_manual_stop",
+                override_decision["reason"],
+                override_type=override_decision.get("override_type", ""),
+            )
             self.apply_override(
                 item_id,
                 amount,
@@ -840,29 +1404,112 @@ class RecipeEngine:
             item = {}
 
         if item and item_has_account_bound_flags(item):
+            wiki_summary = self.wiki_recipe_summary_for_item(item_id, item_name)
             reason = (
-                "The official API lists this item as account-bound or soulbound. "
-                "Track this requirement manually instead of expanding it as "
-                "normal crafting materials."
+                "The official API lists this item as account-bound or soulbound, so "
+                "automatic material expansion stops here."
             )
+
+            if wiki_summary["row_count"] > 0:
+                source_url = wiki_summary.get("source_url", "")
+                review_status = wiki_summary.get("review_status", "")
+                option_count = int(wiki_summary.get("acquisition_option_count", 0))
+                reason += (
+                    " Use the imported GW2 Wiki source data as a manual acquisition "
+                    f"step. Review status: {review_status or 'n/a'}. "
+                    f"Acquisition options found: {option_count}."
+                )
+
+                if source_url:
+                    reason += f" Source URL: {source_url}"
+
+                self.record_wiki_source_usage(
+                    item_id,
+                    item_name,
+                    wiki_summary,
+                    used_for_recipe=False,
+                    selection_reason="Account-bound item kept as a manual source step.",
+                )
+            else:
+                reason += (
+                    " Add a verified override or imported acquisition notes so this can "
+                    "be shown as a useful manual source step."
+                )
+
             self.add_manual_step(item_id, amount, reason, current_path)
-            self.add_warning(f"{item_name}: {reason}")
+            self.record_resolution(
+                item_id,
+                "account_bound_manual_source_step",
+                reason,
+                source_url=wiki_summary.get("source_url", ""),
+                review_status=wiki_summary.get("review_status", ""),
+                acquisition_option_count=int(
+                    wiki_summary.get("acquisition_option_count", 0)
+                ),
+            )
             return
 
-        try:
-            recipe_ids = self.recipe_ids_for_output(item_id)
-        except RecipeApiError as error:
-            reason = (
-                "The official recipe lookup failed, so this branch needs manual "
-                f"review. Details: {error}"
-            )
-            self.add_manual_step(item_id, amount, reason, current_path)
-            self.add_warning(f"{item_name}: {reason}")
-            return
+        official_lookup = self.official_recipe_lookup_summary(item_id)
 
-        if not recipe_ids:
+        if official_lookup["status"] in {"lookup_failed", "no_recipe"}:
+            wiki_summary = self.wiki_recipe_summary_for_item(item_id, item_name)
+
+            if wiki_summary.get("selected_recipe") is not None:
+                self.apply_wiki_recipe(
+                    item_id,
+                    amount,
+                    wiki_summary,
+                    current_path,
+                    active_item_ids,
+                    depth,
+                    max_depth,
+                )
+                return
+
+            if wiki_summary["row_count"] > 0:
+                reason = (
+                    f"{official_lookup['reason']} Imported GW2 Wiki data needs review "
+                    f"before this branch can be expanded automatically. {wiki_summary['reason']}"
+                )
+                self.add_manual_step(item_id, amount, reason, current_path)
+                self.add_warning(f"{item_name}: {reason}")
+                self.record_resolution(
+                    item_id,
+                    "wiki_manual_gap",
+                    reason,
+                    source_url=wiki_summary.get("source_url", ""),
+                    review_status=wiki_summary.get("review_status", ""),
+                    acquisition_option_count=int(
+                        wiki_summary.get("acquisition_option_count", 0)
+                    ),
+                    multiple_acquisition_options=bool(
+                        wiki_summary.get("multiple_acquisition_options", False)
+                    ),
+                )
+                self.record_wiki_source_usage(
+                    item_id,
+                    item_name,
+                    wiki_summary,
+                    used_for_recipe=False,
+                    selection_reason=wiki_summary["reason"],
+                )
+                return
+
+            if official_lookup["status"] == "lookup_failed":
+                reason = (
+                    "The official recipe lookup failed, and no imported GW2 Wiki recipe "
+                    f"data was available. Review this item manually. Details: "
+                    f"{official_lookup['error']}"
+                )
+                self.add_manual_step(item_id, amount, reason, current_path)
+                self.add_warning(f"{item_name}: {reason}")
+                self.record_resolution(item_id, "manual_recipe_gap", reason)
+                return
+
             self.handle_no_recipe(item_id, amount, depth, current_path)
             return
+
+        recipe_ids = list(official_lookup["recipe_ids"])
 
         recipe_id = self.select_recipe_id(item_id, recipe_ids)
 
@@ -872,6 +1519,7 @@ class RecipeEngine:
                 "is configured."
             )
             self.add_manual_step(item_id, amount, reason, current_path)
+            self.record_resolution(item_id, "manual_preferred_recipe_needed", reason)
             return
 
         try:
@@ -883,6 +1531,7 @@ class RecipeEngine:
             )
             self.add_manual_step(item_id, amount, reason, current_path)
             self.add_warning(f"{item_name}: {reason}")
+            self.record_resolution(item_id, "manual_recipe_gap", reason)
             return
 
         if not recipe:
@@ -892,10 +1541,18 @@ class RecipeEngine:
             )
             self.add_manual_step(item_id, amount, reason, current_path)
             self.add_warning(f"{item_name}: {reason}")
+            self.record_resolution(item_id, "manual_recipe_gap", reason)
             return
 
         output_count = max(int(recipe.get("output_item_count", 1)), 1)
         craft_count = math.ceil(amount / output_count)
+        self.record_resolution(
+            item_id,
+            "official_api",
+            f"Official recipe {recipe_id} was selected.",
+            recipe_id=recipe_id,
+            recipe_ids=list(recipe_ids),
+        )
         self.add_recipe_used(recipe, item_id, craft_count)
 
         if depth > 0:
@@ -907,6 +1564,7 @@ class RecipeEngine:
             reason = f"Recipe {recipe_id} has no readable ingredient list."
             self.add_manual_step(item_id, amount, reason, current_path)
             self.add_warning(f"{item_name}: {reason}")
+            self.record_resolution(item_id, "manual_recipe_gap", reason)
             return
 
         next_active_item_ids = set(active_item_ids)
@@ -954,6 +1612,8 @@ class RecipeEngine:
         self.craftable_ingredients = {}
         self.manual_steps = {}
         self.recipes_used = {}
+        self.resolution_log = {}
+        self.wiki_sources_used = {}
         self.warnings = []
 
         normalized_final_item_id = int(final_item_id)
@@ -990,7 +1650,42 @@ class RecipeEngine:
                 self.recipes_used.values(),
                 key=lambda entry: (entry["output_item_name"], entry["recipe_id"]),
             ),
+            "final_source": dict(self.resolution_log.get(normalized_final_item_id, {})),
+            "resolution_sources": sorted(
+                self.resolution_log.values(),
+                key=lambda entry: (entry["name"], entry["item_id"]),
+            ),
+            "wiki_sources_used": sorted(
+                self.wiki_sources_used.values(),
+                key=lambda entry: (entry["name"], entry["item_id"]),
+            ),
             "warnings": list(self.warnings),
+        }
+
+    def debug_recipe_source(
+        self,
+        item_id: int,
+        item_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Return a detailed recipe-source decision summary for one item."""
+
+        resolved_name = item_name or self.item_name(item_id)
+        override_summary = self.override_decision_for_item(item_id, resolved_name)
+        official_summary = self.official_recipe_lookup_summary(item_id)
+        wiki_summary = self.wiki_recipe_summary_for_item(item_id, resolved_name)
+        recipe_tree = self.resolve_recipe_tree(item_id)
+
+        return {
+            "final_item_id": int(item_id),
+            "final_item_name": recipe_tree.get("final_item_name", resolved_name),
+            "override_lookup": override_summary,
+            "official_recipe_lookup": official_summary,
+            "wiki_recipe_rows": wiki_summary.get("rows", []),
+            "wiki_recipe_row_count": int(wiki_summary.get("row_count", 0)),
+            "acquisition_options": wiki_summary.get("acquisition_options", []),
+            "acquisition_option_count": int(wiki_summary.get("acquisition_option_count", 0)),
+            "wiki_summary": wiki_summary,
+            "chosen_source": recipe_tree.get("final_source", {}),
         }
 
 

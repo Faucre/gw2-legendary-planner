@@ -28,6 +28,7 @@ from reference_database import (
     ReferenceApiError,
     ReferenceDatabase,
     WikiImportError,
+    normalize_wiki_item_text,
     reference_database_status,
     setup_reference_database,
 )
@@ -1559,6 +1560,14 @@ def recipe_tree_to_material_entries(recipe_tree: dict[str, Any]) -> list[dict[st
     """Convert recipe-engine terminal materials into normal goal entries."""
 
     material_entries: list[dict[str, Any]] = []
+    wiki_sources_used = list(recipe_tree.get("wiki_sources_used", []))
+    source_hint = "Auto-resolved from the official GW2 recipe API."
+
+    if wiki_sources_used:
+        source_hint = (
+            "Auto-resolved from public recipe data using the official GW2 API plus "
+            "GW2 Wiki fallback data where needed."
+        )
 
     for material in recipe_tree.get("raw_material_requirements", []):
         material_entries.append(
@@ -1566,7 +1575,7 @@ def recipe_tree_to_material_entries(recipe_tree: dict[str, Any]) -> list[dict[st
                 "item_id": int(material["item_id"]),
                 "name": material.get("name", f"Item {material['item_id']}"),
                 "amount": int(material["amount"]),
-                "source_hint": "Auto-resolved from the official GW2 recipe API.",
+                "source_hint": source_hint,
             }
         )
 
@@ -1720,47 +1729,232 @@ def validate_recipe_lookup(
     if final_item_id is None:
         return "no (no final item resolved)", []
 
-    override = recipe_engine.override_for_item(final_item_id, final_item_name)
+    override_summary = recipe_engine.override_decision_for_item(
+        final_item_id,
+        final_item_name,
+    )
 
-    if override:
-        override_type = override.get("type", "manual")
+    if override_summary["status"] == "verified_ingredients":
+        override_type = override_summary.get("override_type", "manual")
+        return f"yes (verified {override_type} override ingredients)", []
 
-        if override.get("ingredients"):
-            return f"yes (verified {override_type} override ingredients)", []
-
+    if override_summary["status"] == "manual_stop":
+        override_type = override_summary.get("override_type", "manual")
         return f"manual ({override_type} override)", []
 
-    try:
-        recipe_ids = recipe_engine.recipe_ids_for_output(final_item_id)
-    except RecipeApiError as error:
-        return "unknown (recipe API lookup failed)", [f"Recipe lookup failed: {error}"]
+    official_lookup = recipe_engine.official_recipe_lookup_summary(final_item_id)
 
-    if not recipe_ids:
-        return "Needs legendary override data", [
-            "No official crafting recipe found; this may be expected for "
-            "Mystic Forge or legendary items."
-        ]
+    if official_lookup["status"] == "single_recipe":
+        return f"yes (official recipe {official_lookup['recipe_id']})", []
 
-    if len(recipe_ids) == 1:
-        return f"yes (official recipe {recipe_ids[0]})", []
-
-    preferred_recipe_id = recipe_engine.preferred_recipes_by_output.get(final_item_id)
-
-    if preferred_recipe_id in recipe_ids:
+    if official_lookup["status"] == "preferred_recipe":
         return (
-            f"yes (preferred recipe {preferred_recipe_id} from "
-            f"{len(recipe_ids)} official recipes)",
+            f"yes (preferred recipe {official_lookup['recipe_id']} from "
+            f"{len(official_lookup['recipe_ids'])} official recipes)",
             [],
         )
 
-    recipe_text = ", ".join(str(recipe_id) for recipe_id in recipe_ids)
-    return (
-        "no (multiple recipes need a preferred override)",
-        [
-            "Multiple official recipes output this item. Add a preferred recipe "
-            f"in data/recipe_overrides.json. Recipe IDs: {recipe_text}"
-        ],
+    if official_lookup["status"] == "multiple_recipes":
+        return (
+            "no (multiple recipes need a preferred override)",
+            [official_lookup["reason"]],
+        )
+
+    wiki_summary = recipe_engine.wiki_recipe_summary_for_item(
+        final_item_id,
+        final_item_name,
     )
+
+    if wiki_summary.get("selected_recipe") is not None:
+        warnings = [
+            "Using imported GW2 Wiki recipe data as an unreviewed fallback.",
+        ]
+
+        if wiki_summary.get("source_url"):
+            warnings.append(f"Source URL: {wiki_summary['source_url']}")
+
+        return "yes (GW2 Wiki imported recipe fallback)", warnings
+
+    if wiki_summary["row_count"] > 0:
+        warnings = [wiki_summary["reason"]]
+
+        if wiki_summary.get("source_url"):
+            warnings.append(f"Source URL: {wiki_summary['source_url']}")
+
+        return "review (GW2 Wiki imported source needs verification)", warnings
+
+    if official_lookup["status"] == "lookup_failed":
+        return "unknown (recipe API lookup failed)", [official_lookup["reason"]]
+
+    return "Needs legendary override data", [
+        "No official crafting recipe or usable imported wiki recipe was found."
+    ]
+
+
+def build_debug_recipe_source_report(
+    item_name: str,
+    rebuild_item_index: bool = False,
+) -> str:
+    """Build a focused report that explains which recipe source would be used."""
+
+    cache = load_item_cache(DEFAULT_ITEM_CACHE_PATH)
+    reference_database = reference_database_if_available()
+    index: dict[str, Any] | None = None
+
+    if not reference_database:
+        index = ensure_item_name_index(
+            DEFAULT_ITEM_NAME_INDEX_PATH,
+            rebuild=rebuild_item_index,
+        )
+
+    resolved_item, warnings = validation_item_lookup(
+        item_name,
+        cache,
+        DEFAULT_ITEM_CACHE_PATH,
+        index,
+        "Item",
+        reference_database=reference_database,
+    )
+
+    lines = [
+        "Recipe Source Debug",
+        f"Requested item: {item_name}",
+    ]
+
+    if warnings:
+        lines.append("Lookup warnings:")
+        for warning in warnings:
+            lines.append(f"  - {warning}")
+
+    if not resolved_item:
+        lines.append("Could not resolve the requested item to one final item ID.")
+        return "\n".join(lines)
+
+    final_item_id = int(resolved_item["item_id"])
+    final_item_name = str(resolved_item.get("name", item_name))
+    recipe_engine = RecipeEngine()
+    debug_data = recipe_engine.debug_recipe_source(final_item_id, final_item_name)
+    override_lookup = debug_data["override_lookup"]
+    official_lookup = debug_data["official_recipe_lookup"]
+    wiki_summary = debug_data["wiki_summary"]
+    chosen_source = debug_data["chosen_source"]
+
+    lines.extend(
+        [
+            f"Final item: {final_item_name} (item_id {final_item_id})",
+            "",
+            "Official API recipe lookup:",
+            f"  - status: {official_lookup['status']}",
+            f"  - reason: {official_lookup['reason']}",
+        ]
+    )
+
+    if official_lookup.get("recipe_ids"):
+        recipe_text = ", ".join(str(recipe_id) for recipe_id in official_lookup["recipe_ids"])
+        lines.append(f"  - recipe_ids: {recipe_text}")
+
+    override = override_lookup.get("override")
+    lines.extend(
+        [
+            "",
+            "Override lookup:",
+            f"  - status: {override_lookup['status']}",
+            f"  - reason: {override_lookup['reason']}",
+        ]
+    )
+
+    if override:
+        lines.append(f"  - type: {override.get('type', 'manual')}")
+        lines.append(f"  - verified: {bool(override.get('verified', False))}")
+        lines.append(f"  - ingredient_count: {len(override.get('ingredients', []))}")
+
+    lines.extend(
+        [
+            "",
+            "Imported wiki reference data:",
+            f"  - wiki_recipes rows found: {debug_data['wiki_recipe_row_count']}",
+            f"  - acquisition_options found: {debug_data['acquisition_option_count']}",
+            f"  - multiple acquisition options: "
+            f"{'yes' if wiki_summary.get('multiple_acquisition_options') else 'no'}",
+            f"  - review_status: {wiki_summary.get('review_status') or 'n/a'}",
+            f"  - source_url: {wiki_summary.get('source_url') or 'n/a'}",
+            f"  - reason: {wiki_summary.get('reason', 'No wiki data found.')}",
+        ]
+    )
+
+    lines.extend(
+        [
+            "",
+            "Chosen source:",
+            f"  - source: {chosen_source.get('source', 'unknown')}",
+            f"  - reason: {chosen_source.get('reason', 'No final source decision was recorded.')}",
+        ]
+    )
+
+    return "\n".join(lines)
+
+
+def build_debug_wiki_name_report(wiki_text: str) -> str:
+    """Show how one wiki item-name snippet is normalized and resolved."""
+
+    name_details = normalize_wiki_item_text(wiki_text)
+    reference_database = reference_database_if_available()
+    lines = [
+        "Wiki Name Debug",
+        f"Original text: {name_details['original_text']}",
+        f"Stripped text: {name_details['stripped_text'] or 'n/a'}",
+        f"Display text: {name_details['display_text'] or 'n/a'}",
+        f"Page title fallback: {name_details['page_title'] or 'n/a'}",
+        f"Preferred normalized name: {name_details['normalized_name'] or 'n/a'}",
+        "Resolution candidates:",
+    ]
+
+    if not name_details["candidates"]:
+        lines.append("  - none")
+    else:
+        for candidate in name_details["candidates"]:
+            lines.append(f"  - {candidate}")
+
+    if not reference_database:
+        lines.append("")
+        lines.append(f"Reference database not found at {DEFAULT_REFERENCE_DB_PATH}.")
+        return "\n".join(lines)
+
+    selected_match: dict[str, Any] | None = None
+    selected_candidate = ""
+    lines.append("")
+    lines.append("Reference database matches:")
+
+    for candidate in name_details["candidates"]:
+        matches = reference_database.item_name_matches(candidate)
+
+        if len(matches) == 1 and selected_match is None:
+            selected_match = matches[0]
+            selected_candidate = candidate
+
+        if not matches:
+            lines.append(f"  - {candidate}: no exact match")
+            continue
+
+        match_text = ", ".join(
+            f"{match.get('name', 'Unknown name')} (item_id {match['item_id']})"
+            for match in matches[:10]
+        )
+        suffix = "" if len(matches) <= 10 else f" plus {len(matches) - 10} more"
+        lines.append(f"  - {candidate}: {match_text}{suffix}")
+
+    lines.append("")
+
+    if selected_match:
+        lines.append(
+            "Chosen resolution: "
+            f"{selected_match.get('name', selected_candidate)} "
+            f"(item_id {selected_match['item_id']}) from candidate '{selected_candidate}'"
+        )
+    else:
+        lines.append("Chosen resolution: none; add item_id or a verified override if needed.")
+
+    return "\n".join(lines)
 
 
 def build_validate_goals_report(
@@ -2649,6 +2843,33 @@ def step_is_configuration_work(step: dict[str, Any]) -> bool:
     return any(word in step_text for word in setup_words)
 
 
+def target_has_verified_final_item(target: dict[str, Any]) -> bool:
+    """Check whether the target already has a resolved final item identity."""
+
+    final_item_id = target_final_item_id(target)
+    final_item_name = str(target.get("final_item_name", "")).strip()
+    return final_item_id is not None and bool(final_item_name)
+
+
+def step_is_stale_final_item_todo(step: dict[str, Any]) -> bool:
+    """Detect old checklist items that only ask us to verify final_item_id."""
+
+    step_text = normalize_item_name(f"{step['name']} {step.get('notes', '')}")
+    return "final_item_id" in step_text or "final item id" in step_text
+
+
+def hide_stale_final_item_steps(
+    target: dict[str, Any],
+    steps: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Hide final-item verification TODOs after the final item is resolved."""
+
+    if not target_has_verified_final_item(target):
+        return steps
+
+    return [step for step in steps if not step_is_stale_final_item_todo(step)]
+
+
 def split_incomplete_steps(
     steps: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -2697,6 +2918,7 @@ def target_needs_recipe_data(
 
 
 def target_status_label(
+    target: dict[str, Any],
     is_unlocked: bool,
     needs_recipe_data: bool,
     missing_items: list[dict[str, Any]],
@@ -2708,14 +2930,28 @@ def target_status_label(
     if is_unlocked:
         return "Complete"
 
-    if needs_recipe_data:
-        return "Needs recipe data"
+    if target_final_item_id(target) is None:
+        return "Needs final item data"
+
+    recipe_tree = target.get(RECIPE_TREE_FIELD, {})
+    has_auto_materials = bool(target.get(AUTO_RECIPE_MATERIALS_FIELD, []))
+    has_manual_source_steps = bool(target.get(RECIPE_UNKNOWN_STEPS_FIELD, []))
+    used_wiki_fallback = bool(recipe_tree.get("wiki_sources_used", []))
+
+    if has_manual_source_steps and (has_auto_materials or used_wiki_fallback):
+        return "Partially resolved"
+
+    if has_manual_source_steps:
+        return "Needs manual source data"
 
     if missing_items or missing_currencies:
         return "In progress"
 
     if incomplete_steps:
-        return "Needs manual checklist work"
+        return "Needs manual source data"
+
+    if needs_recipe_data:
+        return "Needs recipe data"
 
     return "Complete"
 
@@ -2743,7 +2979,10 @@ def build_target_status(
         ("currency_id", "id"),
         "currencies",
     )
-    steps = normalize_steps(target_name, target.get("steps", []))
+    steps = hide_stale_final_item_steps(
+        target,
+        normalize_steps(target_name, target.get("steps", [])),
+    )
     incomplete_steps = [step for step in steps if not step["complete"]]
     configuration_steps, gameplay_steps = split_incomplete_steps(steps)
     missing_items = get_missing_entries(
@@ -2782,6 +3021,7 @@ def build_target_status(
         "missing_items": missing_items,
         "missing_currencies": missing_currencies,
         "status_label": target_status_label(
+            target,
             is_unlocked,
             needs_recipe_data,
             missing_items,
@@ -2877,22 +3117,41 @@ def make_recipe_engine_lines(target: dict[str, Any], detailed: bool = False) -> 
     if recipe_tree:
         recipes_used = recipe_tree.get("recipes_used", [])
         craftable_ingredients = recipe_tree.get("craftable_ingredients", [])
+        wiki_sources = recipe_tree.get("wiki_sources_used", [])
         lines.append(
             f"    Official API recipes used: {len(recipes_used):,}; "
             f"terminal materials added: {len(auto_materials):,}; "
             f"craftable ingredient types found: {len(craftable_ingredients):,}."
         )
 
+        if wiki_sources:
+            lines.append("    GW2 Wiki fallback data used:")
+            for wiki_source in wiki_sources:
+                lines.append(
+                    f"      - {wiki_source['name']}: source {wiki_source['source']}; "
+                    f"review_status {wiki_source['review_status'] or 'n/a'}; "
+                    f"multiple acquisition options "
+                    f"{'yes' if wiki_source['multiple_acquisition_options'] else 'no'}."
+                )
+                if wiki_source.get("source_url"):
+                    lines.append(f"        Source URL: {wiki_source['source_url']}")
+
         if detailed and craftable_ingredients:
             lines.append("    Craftable ingredients in the resolved tree:")
             for ingredient in craftable_ingredients:
-                lines.append(
-                    f"      - {ingredient['name']}: {ingredient['amount']:,} "
-                    f"via recipe {ingredient['recipe_id']}"
-                )
+                if ingredient.get("recipe_source") == "wiki":
+                    lines.append(
+                        f"      - {ingredient['name']}: {ingredient['amount']:,} "
+                        "via GW2 Wiki recipe data"
+                    )
+                else:
+                    lines.append(
+                        f"      - {ingredient['name']}: {ingredient['amount']:,} "
+                        f"via recipe {ingredient['recipe_id']}"
+                    )
 
     if manual_steps:
-        lines.append("    Manual recipe gaps:")
+        lines.append("    Manual/source steps still needed:")
         for manual_step in manual_steps:
             lines.append(
                 f"      - {manual_step['name']}: {manual_step['amount']:,} needed. "
@@ -3139,17 +3398,23 @@ def build_configuration_recommendations(target_status: dict[str, Any]) -> list[s
     recommendations: list[str] = []
 
     if target_recipe_status_needs_work(target_status["target"]):
-        recommendations.append(
-            f"Recipe data: verify {target_status['name']}'s template, then fill in "
-            "exact materials, currencies, and final_item_id where known."
-        )
+        if target_has_verified_final_item(target_status["target"]):
+            recommendations.append(
+                f"Recipe data: review {target_status['name']}'s remaining source steps, "
+                "then fill in exact materials and currencies where known."
+            )
+        else:
+            recommendations.append(
+                f"Recipe data: verify {target_status['name']}'s final item, then fill in "
+                "exact materials and currencies where known."
+            )
 
     for warning in target_status["recipe_engine_warnings"][:2]:
         recommendations.append(f"Recipe engine: {warning}")
 
     for manual_step in target_status["recipe_unknown_manual_steps"][:2]:
         recommendations.append(
-            f"Recipe gap: review {manual_step['name']} "
+            f"Manual/source step: review {manual_step['name']} "
             f"({manual_step['amount']:,} needed). {manual_step['reason']}"
         )
 
@@ -3364,7 +3629,7 @@ def build_report(
             lines.append(f"  Already unlocked in Legendary Armory: {final_item_name}")
             step_lines = make_step_lines(
                 target_name,
-                target.get("steps", []),
+                target_status["steps"],
                 show_complete,
                 detailed=detailed,
             )
@@ -3378,7 +3643,7 @@ def build_report(
 
         step_lines = make_step_lines(
             target_name,
-            target.get("steps", []),
+            target_status["steps"],
             show_complete,
             detailed=detailed,
         )
@@ -3474,6 +3739,16 @@ def parse_args() -> argparse.Namespace:
         help="Show local public reference database status.",
     )
     parser.add_argument(
+        "--debug-recipe-source",
+        default=None,
+        help="Explain which recipe source the engine would choose for one item name.",
+    )
+    parser.add_argument(
+        "--debug-wiki-name",
+        default=None,
+        help="Show how one wiki item-name snippet is normalized and resolved.",
+    )
+    parser.add_argument(
         "--show-complete",
         action="store_true",
         help="Also show goals that are already complete.",
@@ -3561,6 +3836,19 @@ def main() -> int:
 
         if args.reference_db_status:
             print(build_reference_db_status_report())
+            return 0
+
+        if args.debug_recipe_source:
+            print(
+                build_debug_recipe_source_report(
+                    args.debug_recipe_source,
+                    rebuild_item_index=args.rebuild_item_index,
+                )
+            )
+            return 0
+
+        if args.debug_wiki_name:
+            print(build_debug_wiki_name_report(args.debug_wiki_name))
             return 0
 
         if not DEFAULT_REFERENCE_DB_PATH.exists():

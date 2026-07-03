@@ -101,6 +101,8 @@ To build or refresh the local public reference database:
 python gw2_legendary_planner.py --setup-reference-db
 python gw2_legendary_planner.py --update-reference-db
 python gw2_legendary_planner.py --reference-db-status
+python gw2_legendary_planner.py --debug-recipe-source "Klobjarne Geirr"
+python gw2_legendary_planner.py --debug-wiki-name "Dragon's Claw (weapon)|Dragon's Claw"
 ```
 
 Normal planner runs use `data/planner_reference.sqlite` when it exists. Setup/update commands fetch public item and recipe data, build lookup tables, apply `data/recipe_overrides.json`, then import targeted wiki data only for configured targets that still have no official recipe or verified override ingredients. Account-specific caches stay separate.
@@ -122,7 +124,17 @@ The engine recursively follows craftable ingredients and adds terminal raw/mater
 
 The recipe engine does not use your account API key. It only reads public API data.
 
-Wiki imports are stored as source material, not trusted recipe totals. Imported wiki rows and acquisition options are marked `wiki_imported_unreviewed` until you manually verify them and copy verified ingredients into `data/recipe_overrides.json`.
+Wiki imports are stored as source material, not trusted recipe totals. Imported wiki rows and acquisition options are marked `wiki_imported_unreviewed`.
+
+Normal runs now use imported wiki recipe data as a fallback only when:
+
+- no official recipe exists or the official recipe lookup fails
+- no verified override ingredients are available first
+- the imported wiki data points to one clear recipe choice
+
+Verified override ingredients still win first. Manual/account-bound/time-gated style overrides with no ingredients still stop automatic expansion immediately. Unverified empty `mystic_forge` override stubs are treated as review placeholders instead of hard stops, so they no longer block imported wiki data.
+
+If imported wiki data has multiple acquisition options and no single recipe option is clearly marked, the planner refuses to guess and adds a warning/manual recipe gap instead.
 
 Automatic resolution stops and adds a warning instead of guessing when:
 
@@ -286,7 +298,7 @@ Targets without `template` still work as fully manual targets:
 - Before scanning, the script checks `/v2/tokeninfo` and warns if the key is missing needed permissions.
 - Legendary Armory unlocks come from `/v2/account/legendaryarmory`.
 - Targets with `final_item_id` are marked complete when that item is already unlocked.
-- Target status labels are `Complete`, `In progress`, `Needs recipe data`, or `Needs manual checklist work`.
+- Target status labels are `Complete`, `In progress`, `Partially resolved`, `Needs manual source data`, `Needs final item data`, or `Needs recipe data`.
 - Targets with TODO recipe/checklist steps but no material or currency data are marked `Needs recipe data`.
 - Normal output hides empty material/currency sections; use `--detailed` when you want to audit every section.
 - Recipe templates live in `templates/`. If a template has TODO notes, verify the recipe before relying on exact quantities.

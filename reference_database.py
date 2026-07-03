@@ -7,8 +7,10 @@ store API keys, wallet contents, character inventories, or other account data.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -40,6 +42,75 @@ def normalize_item_name(item_name: str) -> str:
     """Make item names easier to compare by ignoring case and extra spaces."""
 
     return " ".join(item_name.casefold().split())
+
+
+def normalize_wiki_item_text(wiki_text: str) -> dict[str, Any]:
+    """Strip common wiki markup and return item-name resolution candidates."""
+
+    original_text = str(wiki_text).strip()
+    text = original_text.replace("\xa0", " ")
+    page_title = ""
+    display_text = ""
+
+    def replace_link(match: re.Match[str]) -> str:
+        nonlocal page_title, display_text
+        link_page = match.group("page").strip()
+        link_display = (match.group("display") or link_page).strip()
+
+        if not page_title:
+            page_title = link_page.split("#", 1)[0].strip()
+
+        if not display_text:
+            display_text = link_display
+
+        return link_display
+
+    text = re.sub(
+        r"\[\[(?P<page>[^\]|]+)(?:\|(?P<display>[^\]]+))?\]\]",
+        replace_link,
+        text,
+    )
+
+    if not page_title and "|" in text and "{{" not in text and "}}" not in text:
+        left, _separator, right = text.partition("|")
+        page_title = left.strip()
+        display_text = right.strip()
+        text = display_text or page_title
+
+    def replace_template(match: re.Match[str]) -> str:
+        parts = [part.strip() for part in match.group(1).split("|")]
+
+        if len(parts) >= 3:
+            return parts[2]
+
+        if len(parts) >= 2:
+            return parts[1]
+
+        return ""
+
+    text = re.sub(r"\{\{([^{}]+)\}\}", replace_template, text)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = text.replace("'''", "").replace("''", "")
+    text = text.replace("[[", "").replace("]]", "")
+    text = " ".join(text.split()).strip()
+
+    normalized_name = display_text or text or page_title
+    candidates: list[str] = []
+
+    for candidate in (normalized_name, page_title):
+        candidate = " ".join(candidate.split()).strip()
+
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+
+    return {
+        "original_text": original_text,
+        "normalized_name": normalized_name,
+        "page_title": page_title,
+        "display_text": display_text,
+        "stripped_text": text,
+        "candidates": candidates,
+    }
 
 
 def chunked(values: list[int], size: int) -> list[list[int]]:
@@ -177,11 +248,13 @@ def extract_acquisition_options_from_wikitext(wikitext: str) -> list[dict[str, A
             continue
 
         if line.startswith("*") or line.startswith("#") or "{{Recipe" in line:
+            normalized_line = normalize_wiki_item_text(line)
             options.append(
                 {
                     "acquisition_type": current_type,
                     "heading": current_heading,
                     "text": line,
+                    "normalized_text": normalized_line["stripped_text"],
                 }
             )
 
@@ -206,12 +279,24 @@ class ReferenceDatabase:
         connection.row_factory = sqlite3.Row
         return connection
 
+    @contextmanager
+    def open_connection(self) -> Any:
+        """Open a SQLite connection that always closes after use."""
+
+        connection = self.connect()
+
+        try:
+            yield connection
+            connection.commit()
+        finally:
+            connection.close()
+
     def initialize_schema(self) -> None:
         """Create tables for public reference data."""
 
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
-        with self.connect() as connection:
+        with self.open_connection() as connection:
             connection.executescript(
                 """
                 PRAGMA foreign_keys = ON;
@@ -369,7 +454,7 @@ class ReferenceDatabase:
         imported_count = 0
         now = int(time.time())
 
-        with self.connect() as connection:
+        with self.open_connection() as connection:
             for item_id_chunk in chunked(item_ids, API_BATCH_SIZE):
                 rows = public_api_get(
                     "/items",
@@ -426,7 +511,7 @@ class ReferenceDatabase:
         imported_count = 0
         now = int(time.time())
 
-        with self.connect() as connection:
+        with self.open_connection() as connection:
             for recipe_id_chunk in chunked(recipe_ids, API_BATCH_SIZE):
                 rows = public_api_get(
                     "/recipes",
@@ -517,7 +602,7 @@ class ReferenceDatabase:
         now = int(time.time())
         applied_count = 0
 
-        with self.connect() as connection:
+        with self.open_connection() as connection:
             connection.execute("DELETE FROM recipe_overrides")
 
             for index, override in enumerate(override_rows, start=1):
@@ -558,7 +643,7 @@ class ReferenceDatabase:
         acquisition_options = 0
         now = int(time.time())
 
-        with self.connect() as connection:
+        with self.open_connection() as connection:
             for item in items:
                 item_id = int(item["item_id"])
                 name = str(item.get("name") or f"Item {item_id}")
@@ -666,7 +751,7 @@ class ReferenceDatabase:
         if not self.exists():
             return []
 
-        with self.connect() as connection:
+        with self.open_connection() as connection:
             rows = connection.execute(
                 """
                 SELECT item_id, name
@@ -691,7 +776,7 @@ class ReferenceDatabase:
         unique_item_ids = sorted({int(item_id) for item_id in item_ids})
         items: dict[int, dict[str, Any]] = {}
 
-        with self.connect() as connection:
+        with self.open_connection() as connection:
             for item_id_chunk in chunked(unique_item_ids, 500):
                 placeholders = ",".join("?" for _item_id in item_id_chunk)
                 rows = connection.execute(
@@ -710,7 +795,7 @@ class ReferenceDatabase:
         if not self.exists():
             return []
 
-        with self.connect() as connection:
+        with self.open_connection() as connection:
             rows = connection.execute(
                 """
                 SELECT recipe_id
@@ -732,7 +817,7 @@ class ReferenceDatabase:
         unique_recipe_ids = sorted({int(recipe_id) for recipe_id in recipe_ids})
         recipes: dict[int, dict[str, Any]] = {}
 
-        with self.connect() as connection:
+        with self.open_connection() as connection:
             for recipe_id_chunk in chunked(unique_recipe_ids, 500):
                 placeholders = ",".join("?" for _recipe_id in recipe_id_chunk)
                 rows = connection.execute(
@@ -745,13 +830,83 @@ class ReferenceDatabase:
 
         return recipes
 
+    def wiki_recipes_for_output(self, item_id: int) -> list[dict[str, Any]]:
+        """Return imported wiki recipe rows for one output item."""
+
+        if not self.exists():
+            return []
+
+        with self.open_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT recipe_key, output_item_id, name, source_url, review_status, raw_json
+                FROM wiki_recipes
+                WHERE output_item_id = ?
+                ORDER BY recipe_key
+                """,
+                (int(item_id),),
+            ).fetchall()
+
+        recipes: list[dict[str, Any]] = []
+
+        for row in rows:
+            payload = json.loads(row["raw_json"])
+            recipes.append(
+                {
+                    "recipe_key": row["recipe_key"],
+                    "output_item_id": int(row["output_item_id"]),
+                    "name": row["name"],
+                    "source_url": row["source_url"],
+                    "review_status": row["review_status"],
+                    "raw_json": payload,
+                }
+            )
+
+        return recipes
+
+    def acquisition_options_for_item(self, item_id: int) -> list[dict[str, Any]]:
+        """Return imported acquisition-option rows for one item."""
+
+        if not self.exists():
+            return []
+
+        with self.open_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT option_id, item_id, acquisition_type, source, source_url,
+                       review_status, raw_json
+                FROM acquisition_options
+                WHERE item_id = ?
+                ORDER BY option_id
+                """,
+                (int(item_id),),
+            ).fetchall()
+
+        options: list[dict[str, Any]] = []
+
+        for row in rows:
+            payload = json.loads(row["raw_json"])
+            options.append(
+                {
+                    "option_id": int(row["option_id"]),
+                    "item_id": int(row["item_id"]),
+                    "acquisition_type": row["acquisition_type"],
+                    "source": row["source"],
+                    "source_url": row["source_url"],
+                    "review_status": row["review_status"],
+                    "raw_json": payload,
+                }
+            )
+
+        return options
+
     def status(self) -> dict[str, str]:
         """Return metadata and table counts for display."""
 
         if not self.exists():
             return {"exists": "false", "path": str(self.db_path)}
 
-        with self.connect() as connection:
+        with self.open_connection() as connection:
             metadata_rows = connection.execute(
                 "SELECT key, value FROM metadata ORDER BY key"
             ).fetchall()
