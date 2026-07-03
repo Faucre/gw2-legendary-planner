@@ -15,6 +15,7 @@ from gw2_legendary_planner import (
     build_rule_recommendations,
     build_target_breakdown,
     build_target_status,
+    format_explain_missing_report,
     format_target_breakdown,
     make_recipe_engine_lines,
     recipe_tree_to_material_entries,
@@ -1031,13 +1032,127 @@ class RecipeEngineWikiFallbackTests(unittest.TestCase):
         self.assertIn("Gift of Janthir Wilds: expanded", text)
         self.assertIn("Gift of Klobjarne Geirr: expanded", text)
         self.assertIn("Gift of the Homesteader: expanded", text)
-        self.assertIn("Mystic Clover: have 8, need 38, missing 30", text)
-        self.assertIn("Mystic Runestone: have 20, need 100, missing 80", text)
+        self.assertIn("Mystic Clover [normal material; official_api]: have 8, need 38, missing 30", text)
+        self.assertIn("Mystic Runestone [vendor item; manual_review_needed]: have 20, need 100, missing 80", text)
         self.assertIn("Bloodstone Shard", text)
         self.assertIn("Gift of Research", text)
         self.assertIn("Gift of the Mists", text)
         self.assertIn("Recommended next actions", text)
         self.assertIn("Mystic Clover: do Wizard's Vault", text)
+        self.assertIn("Used in: Legendary Spear > Gift of the Homesteader > Mystic Clover", text)
+        self.assertIn("[vendor item;", text)
+
+        clover_explain = format_explain_missing_report(breakdown, "Mystic Clover")
+        self.assertIn(
+            "Legendary Spear > Gift of the Homesteader > Mystic Clover",
+            clover_explain,
+        )
+        self.assertIn("Category: normal material", clover_explain)
+
+        runestone_explain = format_explain_missing_report(breakdown, "Mystic Runestone")
+        self.assertIn(
+            "Legendary Spear > Gift of Klobjarne Geirr > Mystic Runestone",
+            runestone_explain,
+        )
+        self.assertIn("Category: vendor item", runestone_explain)
+
+    def test_duplicate_wiki_recipe_ingredient_is_flagged_for_review(self) -> None:
+        connection = self.reference_database.connect()
+        try:
+            insert_item(connection, 6000, "Hydrocatalytic Reagent")
+            insert_wiki_recipe(
+                connection,
+                self.root_item_id,
+                self.root_item_name,
+                "\n".join(
+                    [
+                        "{{Recipe",
+                        "| source = Mystic Forge",
+                        "| ingredient1 = 250 Hydrocatalytic Reagent",
+                        "| ingredient2 = 250 Hydrocatalytic Reagent",
+                        "}}",
+                    ]
+                ),
+                source_url=self.source_url,
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        self.write_overrides(
+            [
+                {
+                    "item_id": self.root_item_id,
+                    "name": self.root_item_name,
+                    "type": "mystic_forge",
+                    "verified": False,
+                    "ingredients": [],
+                }
+            ]
+        )
+
+        engine = self.make_engine()
+        tree = engine.resolve_recipe_tree(self.root_item_id)
+
+        self.assertTrue(
+            any("duplicate ingredient names" in warning for warning in tree["warnings"])
+        )
+
+    def test_owned_intermediate_keeps_satisfied_path_and_hides_child_path(self) -> None:
+        connection = self.reference_database.connect()
+        try:
+            insert_item(connection, 7000, "Gift of the Homesteader", flags=["AccountBound"])
+            insert_item(connection, 7001, "Mystic Clover")
+            insert_wiki_recipe(
+                connection,
+                self.root_item_id,
+                self.root_item_name,
+                "\n".join(
+                    [
+                        "{{Recipe",
+                        "| source = Mystic Forge",
+                        "| ingredient1 = 1 Gift of the Homesteader",
+                        "}}",
+                    ]
+                ),
+            )
+            insert_wiki_recipe(
+                connection,
+                7000,
+                "Gift of the Homesteader",
+                "\n".join(
+                    [
+                        "{{Recipe",
+                        "| source = Mystic Forge",
+                        "| ingredient1 = 38 Mystic Clovers",
+                        "}}",
+                    ]
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        self.write_overrides(
+            [
+                {
+                    "item_id": self.root_item_id,
+                    "name": self.root_item_name,
+                    "type": "mystic_forge",
+                    "verified": False,
+                    "ingredients": [],
+                }
+            ]
+        )
+
+        engine = self.make_engine()
+        tree = engine.resolve_recipe_tree(self.root_item_id, item_counts={7000: 1})
+
+        self.assertEqual(tree["raw_material_requirements"], [])
+        self.assertEqual(
+            tree["satisfied_intermediates"][0]["paths"],
+            ["Legendary Spear -> Gift of the Homesteader"],
+        )
 
 
 if __name__ == "__main__":

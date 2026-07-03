@@ -54,6 +54,22 @@ major components, expanded components, missing materials, manual/source steps,
 recommended next actions, and warnings. It uses owned intermediate items first
 unless you also pass `--raw-materials`.
 
+To show full recipe paths in the breakdown:
+
+```bash
+python gw2_legendary_planner.py --breakdown "Klobjarne Geirr" --show-paths
+```
+
+To explain why one missing item appears:
+
+```bash
+python gw2_legendary_planner.py --explain-missing "Klobjarne Geirr" "Mystic Clover"
+python gw2_legendary_planner.py --explain-missing "Klobjarne Geirr" "Orichalcum Ore"
+```
+
+Explain output includes the category, confidence label, amount still missing,
+and recipe path such as `Klobjarne Geirr > Gift of the Homesteader > Mystic Clover`.
+
 To also show completed entries:
 
 ```bash

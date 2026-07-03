@@ -1569,13 +1569,26 @@ def recipe_tree_to_material_entries(recipe_tree: dict[str, Any]) -> list[dict[st
             "GW2 Wiki fallback data where needed."
         )
 
+    resolution_by_id = {
+        int(entry["item_id"]): entry
+        for entry in recipe_tree.get("resolution_sources", [])
+        if entry.get("item_id") is not None
+    }
+
     for material in recipe_tree.get("raw_material_requirements", []):
+        item_id = int(material["item_id"])
+        resolution = resolution_by_id.get(item_id, {})
+        data_confidence = confidence_from_resolution(resolution, material)
         material_entries.append(
             {
-                "item_id": int(material["item_id"]),
+                "item_id": item_id,
                 "name": material.get("name", f"Item {material['item_id']}"),
                 "amount": int(material["amount"]),
                 "source_hint": source_hint,
+                "paths": list(material.get("paths", [])),
+                "reason": material.get("reason", ""),
+                "data_confidence": data_confidence,
+                "resolution_source": resolution.get("source", ""),
             }
         )
 
@@ -2710,6 +2723,10 @@ def normalize_goal_entries(
                 "amount": int(amount),
                 "name": entry.get("name"),
                 "source_hint": str(entry.get("source_hint", "")).strip(),
+                "paths": list(entry.get("paths", [])),
+                "reason": entry.get("reason", ""),
+                "data_confidence": entry.get("data_confidence", ""),
+                "resolution_source": entry.get("resolution_source", ""),
             }
         )
 
@@ -2800,6 +2817,10 @@ def get_missing_entries(
                     "owned": owned,
                     "missing": missing,
                     "source_hint": entry.get("source_hint", ""),
+                    "paths": list(entry.get("paths", [])),
+                    "reason": entry.get("reason", ""),
+                    "data_confidence": entry.get("data_confidence", ""),
+                    "resolution_source": entry.get("resolution_source", ""),
                 }
             )
 
@@ -2865,6 +2886,45 @@ def is_named_item(missing_entry: dict[str, Any], item_name: str) -> bool:
     return normalize_item_name(missing_entry["name"]) == normalize_item_name(item_name)
 
 
+def confidence_from_resolution(
+    resolution: dict[str, Any],
+    entry: dict[str, Any] | None = None,
+) -> str:
+    """Turn recipe-source metadata into a short trust label."""
+
+    source = str(resolution.get("source", "")).strip()
+    review_status = str(resolution.get("review_status", "")).strip()
+
+    if source == "override_verified_ingredients":
+        return "manual_override_verified"
+
+    if source in {"wiki_recipe", "source_step_recipe"}:
+        if "manual_review_needed" in review_status:
+            return "manual_review_needed"
+
+        return review_status or "wiki_imported_unreviewed"
+
+    if source in {
+        "wiki_manual_gap",
+        "manual_recipe_gap",
+        "manual_preferred_recipe_needed",
+        "account_bound_manual_source_step",
+        "account_bound_manual_stop",
+    }:
+        return "manual_review_needed"
+
+    if source == "manual_cycle_stop" or source == "manual_max_depth_stop":
+        return "ambiguous"
+
+    if source == "official_api" or source == "terminal_material":
+        return "official_api"
+
+    if entry and "account-bound" in str(entry.get("reason", "")).casefold():
+        return "manual_review_needed"
+
+    return source or "official_api"
+
+
 def missing_item_by_name(
     missing_items: list[dict[str, Any]],
     item_name: str,
@@ -2890,6 +2950,73 @@ def is_precursor_step(missing_entry: dict[str, Any]) -> bool:
 
     normalized_name = normalize_item_name(missing_entry["name"])
     return "precursor" in normalized_name or normalized_name in {"nyr hrammr"}
+
+
+def item_category(entry: dict[str, Any], manual_step: bool = False) -> str:
+    """Categorize a missing entry for breakdown output."""
+
+    normalized_name = normalize_item_name(str(entry.get("name", "")))
+    source_type = normalize_item_name(str(entry.get("source_type", "")))
+    confidence = normalize_item_name(str(entry.get("data_confidence", "")))
+
+    if is_precursor_step({"name": entry.get("name", ""), "missing": entry.get("missing", 0)}):
+        return "precursor"
+
+    if source_type in {"achievement", "collection"}:
+        return "achievement/collection step"
+
+    if confidence == "ambiguous" or "manual_review" in confidence or "manual review" in confidence:
+        if manual_step:
+            return "ambiguous/manual review"
+
+    if normalized_name in {"mystic runestone", "bloodstone shard", "eldritch scroll"}:
+        return "vendor item"
+
+    if normalized_name in {"gift of research", "gift of the mists"}:
+        return "account-bound source step"
+
+    if "provisioner" in normalized_name and "token" in normalized_name:
+        return "currency-like item"
+
+    if manual_step:
+        if source_type in {"vendor", "mystic forge", "mystic_forge"}:
+            return "vendor item" if normalized_name in {"mystic runestone", "bloodstone shard"} else "account-bound source step"
+
+        return "account-bound source step"
+
+    if "gift of" in normalized_name:
+        return "craftable component"
+
+    return "normal material"
+
+
+def format_recipe_path(path_text: str) -> str:
+    """Format stored recipe paths for CLI output."""
+
+    return " > ".join(part.strip() for part in str(path_text).split("->") if part.strip())
+
+
+def important_path_entry(entry: dict[str, Any]) -> bool:
+    """Decide whether normal breakdown output should show a Used in line."""
+
+    normalized_name = normalize_item_name(str(entry.get("name", "")))
+    category = str(entry.get("category", ""))
+    important_names = {
+        "mystic clover",
+        "mystic runestone",
+        "bloodstone shard",
+        "gift of research",
+        "gift of the mists",
+        "nyr hrammr",
+        "orichalcum ore",
+    }
+    return normalized_name in important_names or category in {
+        "precursor",
+        "vendor item",
+        "account-bound source step",
+        "achievement/collection step",
+        "ambiguous/manual review",
+    }
 
 
 def is_obsidian_armor_essence(
@@ -3759,6 +3886,7 @@ def build_major_components(
     }
 
     components: list[dict[str, Any]] = []
+    final_item_name = str(recipe_tree.get("final_item_name", "Target"))
 
     for component in recipe_tree.get("major_components", []):
         item_id = component.get("item_id")
@@ -3784,11 +3912,111 @@ def build_major_components(
             "expanded": item_id_int in expanded_ids or item_id_int in craftable_ids,
             "manual_step": item_id_int in manual_ids,
             "is_precursor": is_precursor_step(display_entry),
+            "category": item_category(display_entry),
+            "data_confidence": confidence_from_resolution(
+                {"source": component.get("source", "")}
+            ),
+            "paths": [f"{final_item_name} -> {component.get('name', 'Unnamed component')}"],
         }
         branch["status"] = component_status_label(branch)
         components.append(branch)
 
     return components
+
+
+def build_ranked_breakdown_recommendations(
+    target_status: dict[str, Any],
+    terminal_missing_materials: list[dict[str, Any]],
+    source_steps: list[dict[str, Any]],
+    major_components: list[dict[str, Any]],
+    price_estimates: dict[int, dict[str, Any]] | None,
+) -> list[str]:
+    """Rank next actions for a focused target breakdown."""
+
+    recommendations: list[str] = []
+
+    missing_major_precursors = [
+        component for component in major_components if component["missing"] > 0 and component["is_precursor"]
+    ]
+
+    for component in missing_major_precursors[:1]:
+        recommendations.append(
+            f"Precursor step: focus {component['name']} first; it blocks final assembly."
+        )
+
+    all_missing_items = terminal_missing_materials + source_steps
+
+    if missing_item_by_name(all_missing_items, "Mystic Clover"):
+        recommendations.append(
+            "Mystic Clover: do Wizard's Vault objectives, WvW reward tracks, and weekly vendor sources."
+        )
+
+    if missing_item_by_name(all_missing_items, "Mystic Runestone"):
+        recommendations.append(
+            "Mystic Runestone: check the vendor/source path and plan the purchase cost."
+        )
+
+    janthir_names = [
+        item["name"]
+        for item in terminal_missing_materials
+        if any(
+            word in normalize_item_name(item["name"])
+            for word in (
+                "janthir",
+                "lowland",
+                "mursaat",
+                "honey flower",
+                "titan",
+                "homestead",
+            )
+        )
+    ][:3]
+
+    if janthir_names:
+        recommendations.append(
+            "Janthir materials: route map gathering/currency progress for "
+            f"{', '.join(janthir_names)}."
+        )
+
+    if missing_item_by_name(all_missing_items, "Bloodstone Shard"):
+        recommendations.append(
+            "Bloodstone Shard: check Spirit Shards and Mystic Forge vendor access."
+        )
+
+    source_step_names = [
+        step["name"]
+        for step in source_steps
+        if step.get("category") in {
+            "account-bound source step",
+            "achievement/collection step",
+            "ambiguous/manual review",
+        }
+    ][:3]
+
+    if source_step_names:
+        recommendations.append(
+            "Source-gated gifts: review acquisition paths for "
+            f"{', '.join(source_step_names)}."
+        )
+
+    existing_recommendation_keys = {
+        recommendation.split(":", 1)[0].casefold()
+        for recommendation in recommendations
+        if ":" in recommendation
+    }
+
+    for recommendation in build_gameplay_recommendations(target_status, price_estimates):
+        recommendation_key = (
+            recommendation.split(":", 1)[0].casefold()
+            if ":" in recommendation
+            else recommendation.casefold()
+        )
+
+        if recommendation not in recommendations and recommendation_key not in existing_recommendation_keys:
+            recommendations.append(recommendation)
+            existing_recommendation_keys.add(recommendation_key)
+
+    return recommendations
 
 
 def build_target_breakdown(
@@ -3811,6 +4039,7 @@ def build_target_breakdown(
         currency_names,
     )
     recipe_tree = target.get(RECIPE_TREE_FIELD, {})
+    major_branches = build_major_components(recipe_tree, item_counts)
     manual_steps = list(target_status["recipe_unknown_manual_steps"])
     manual_item_ids = {
         int(step["item_id"])
@@ -3818,7 +4047,11 @@ def build_target_breakdown(
         if step.get("item_id") is not None
     }
     terminal_missing_materials = [
-        item
+        {
+            **item,
+            "category": item_category(item),
+            "data_confidence": item.get("data_confidence") or "official_api",
+        }
         for item in target_status["missing_items"]
         if int(item["id"]) not in manual_item_ids
     ]
@@ -3849,6 +4082,14 @@ def build_target_breakdown(
                 "needed": needed,
                 "owned": missing_entry.get("owned", owned) if missing_entry else owned,
                 "missing": missing,
+                "category": item_category(step, manual_step=True),
+                "data_confidence": confidence_from_resolution(
+                    {
+                        "source": "account_bound_manual_source_step",
+                        "review_status": step.get("review_status", ""),
+                    },
+                    step,
+                ),
             }
         )
 
@@ -3884,10 +4125,18 @@ def build_target_breakdown(
                 "owned": owned,
                 "missing": missing,
                 "reason": "Expanded source-step component; review its acquisition path.",
+                "category": item_category(step, manual_step=True),
+                "data_confidence": step.get("review_status") or "wiki_imported_unreviewed",
             }
         )
 
-    recommendations = build_gameplay_recommendations(target_status, price_estimates)
+    recommendations = build_ranked_breakdown_recommendations(
+        target_status,
+        terminal_missing_materials,
+        source_steps,
+        major_branches,
+        price_estimates,
+    )
     recommendations.extend(build_configuration_recommendations(target_status)[:2])
 
     source_step_names = {normalize_item_name(str(step.get("name", ""))) for step in source_steps}
@@ -3930,7 +4179,7 @@ def build_target_breakdown(
         "status": target_status["status_label"],
         "owned_final_items": owned_final,
         "owned_intermediate_items": list(recipe_tree.get("satisfied_intermediates", [])),
-        "major_branches": build_major_components(recipe_tree, item_counts),
+        "major_branches": major_branches,
         "expanded_ingredients": list(recipe_tree.get("expanded_source_steps", [])),
         "terminal_missing_materials": terminal_missing_materials,
         "account_bound_manual_source_steps": source_steps,
@@ -3948,7 +4197,44 @@ def format_breakdown_entry_amount(entry: dict[str, Any]) -> str:
     return f"have {owned:,}, need {needed:,}, missing {missing:,}"
 
 
-def format_target_breakdown(breakdown: dict[str, Any]) -> str:
+def breakdown_entry_tag(entry: dict[str, Any]) -> str:
+    """Return a compact category/confidence tag for one breakdown line."""
+
+    category = str(entry.get("category", "")).strip()
+    confidence = str(entry.get("data_confidence", "")).strip()
+    bits = [bit for bit in (category, confidence) if bit]
+
+    if not bits:
+        return ""
+
+    return f" [{'; '.join(bits)}]"
+
+
+def add_breakdown_entry_detail_lines(
+    lines: list[str],
+    entry: dict[str, Any],
+    show_paths: bool = False,
+) -> None:
+    """Add category, confidence, and path details for one breakdown entry."""
+
+    paths = [format_recipe_path(path) for path in entry.get("paths", []) if str(path).strip()]
+
+    if not paths:
+        return
+
+    if show_paths:
+        lines.append("    Used in:")
+
+        for path in paths:
+            lines.append(f"      - {path}")
+    elif important_path_entry(entry):
+        lines.append(f"    Used in: {paths[0]}")
+
+
+def format_target_breakdown(
+    breakdown: dict[str, Any],
+    show_paths: bool = False,
+) -> str:
     """Turn a target breakdown dictionary into readable CLI text."""
 
     target = breakdown["target"]
@@ -3983,9 +4269,10 @@ def format_target_breakdown(breakdown: dict[str, Any]) -> str:
     if breakdown["major_branches"]:
         for component in breakdown["major_branches"]:
             lines.append(
-                f"  - {component['name']}: {component['status']} "
+                f"  - {component['name']}: {component['status']}{breakdown_entry_tag(component)} "
                 f"({format_breakdown_entry_amount(component)})"
             )
+            add_breakdown_entry_detail_lines(lines, component, show_paths=show_paths)
     else:
         lines.append("  - No major components were resolved yet.")
 
@@ -4019,7 +4306,11 @@ def format_target_breakdown(breakdown: dict[str, Any]) -> str:
 
     if breakdown["terminal_missing_materials"]:
         for item in breakdown["terminal_missing_materials"]:
-            lines.append(f"  - {item['name']}: {format_breakdown_entry_amount(item)}")
+            lines.append(
+                f"  - {item['name']}{breakdown_entry_tag(item)}: "
+                f"{format_breakdown_entry_amount(item)}"
+            )
+            add_breakdown_entry_detail_lines(lines, item, show_paths=show_paths)
     else:
         lines.append("  - No terminal materials missing after owned items were counted.")
 
@@ -4027,7 +4318,11 @@ def format_target_breakdown(breakdown: dict[str, Any]) -> str:
 
     if breakdown["account_bound_manual_source_steps"]:
         for step in breakdown["account_bound_manual_source_steps"]:
-            lines.append(f"  - {step['name']}: {format_breakdown_entry_amount(step)}")
+            lines.append(
+                f"  - {step['name']}{breakdown_entry_tag(step)}: "
+                f"{format_breakdown_entry_amount(step)}"
+            )
+            add_breakdown_entry_detail_lines(lines, step, show_paths=show_paths)
             source_summary = str(
                 step.get("source_step_summary") or step.get("source_summary") or ""
             ).strip()
@@ -4112,6 +4407,7 @@ def build_breakdown_report(
     currency_names: dict[int, str],
     target_name: str | None = None,
     use_priority: bool = False,
+    show_paths: bool = False,
 ) -> str:
     """Build the focused CLI Legendary Breakdown v1 output."""
 
@@ -4129,7 +4425,118 @@ def build_breakdown_report(
         currency_names,
         price_estimates=None,
     )
-    return format_target_breakdown(breakdown)
+    return format_target_breakdown(breakdown, show_paths=show_paths)
+
+
+def breakdown_entries_for_explain(breakdown: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """Return all explainable missing entries with their section names."""
+
+    entries: list[tuple[str, dict[str, Any]]] = []
+
+    for entry in breakdown.get("major_branches", []):
+        if int(entry.get("missing", 0)) > 0:
+            entries.append(("Major component", entry))
+
+    for entry in breakdown.get("terminal_missing_materials", []):
+        entries.append(("Missing material", entry))
+
+    for entry in breakdown.get("account_bound_manual_source_steps", []):
+        entries.append(("Manual/source step", entry))
+
+    return entries
+
+
+def format_explain_missing_report(
+    breakdown: dict[str, Any],
+    item_name: str,
+) -> str:
+    """Explain why one missing item appears in a target breakdown."""
+
+    normalized_requested_name = normalize_item_name(item_name)
+    matches = [
+        (section, entry)
+        for section, entry in breakdown_entries_for_explain(breakdown)
+        if normalize_item_name(str(entry.get("name", ""))) == normalized_requested_name
+    ]
+    target_name = breakdown["target"]["name"]
+
+    lines = [
+        "Missing Requirement Explanation",
+        "===============================",
+        f"Target: {target_name}",
+        f"Requested item: {item_name}",
+    ]
+
+    if not matches:
+        lines.append("")
+        lines.append("No missing entry with that exact name was found in this breakdown.")
+        return "\n".join(lines).rstrip()
+
+    for section, entry in matches:
+        lines.extend(
+            [
+                "",
+                f"Section: {section}",
+                f"Item: {entry['name']}",
+                f"Amount: {format_breakdown_entry_amount(entry)}",
+                f"Category: {entry.get('category', 'unknown')}",
+                f"Data confidence: {entry.get('data_confidence', 'unknown')}",
+            ]
+        )
+
+        paths = [
+            format_recipe_path(path)
+            for path in entry.get("paths", [])
+            if str(path).strip()
+        ]
+
+        if paths:
+            lines.append("Why it is needed:")
+
+            for path in paths:
+                lines.append(f"  - {path}")
+        else:
+            lines.append("Why it is needed: no path was recorded for this entry yet.")
+
+        source_summary = str(
+            entry.get("source_step_summary") or entry.get("source_summary") or ""
+        ).strip()
+
+        if source_summary:
+            lines.append(f"Source summary: {source_summary}")
+
+        if entry.get("source_url"):
+            lines.append(f"Source URL: {entry['source_url']}")
+
+        if entry.get("reason"):
+            lines.append(f"Reason: {entry['reason']}")
+
+    return "\n".join(lines).rstrip()
+
+
+def build_explain_missing_report(
+    targets: list[dict[str, Any]],
+    wallet: dict[int, int],
+    item_counts: dict[int, int],
+    legendary_armory: dict[int, int],
+    item_names: dict[int, str],
+    currency_names: dict[int, str],
+    target_name: str,
+    item_name: str,
+) -> str:
+    """Build the --explain-missing report for one target and item."""
+
+    target = select_breakdown_target(targets, target_name=target_name)
+    breakdown = build_target_breakdown(
+        target,
+        wallet,
+        item_counts,
+        legendary_armory,
+        item_names,
+        currency_names,
+        price_estimates=None,
+    )
+    return format_explain_missing_report(breakdown, item_name)
 
 
 def add_recommended_today_section(
@@ -4431,6 +4838,17 @@ def parse_args() -> argparse.Namespace:
         help="Show a focused breakdown for the first enabled target in priority order.",
     )
     parser.add_argument(
+        "--show-paths",
+        action="store_true",
+        help="Show full recipe paths in breakdown output.",
+    )
+    parser.add_argument(
+        "--explain-missing",
+        nargs=2,
+        metavar=("TARGET", "ITEM"),
+        help="Explain why one missing item is needed for one target.",
+    )
+    parser.add_argument(
         "--validate-goals",
         action="store_true",
         help="Validate goal/template configuration without scanning the account.",
@@ -4684,6 +5102,29 @@ def main() -> int:
 
         currency_names = fetch_names("/currencies", currency_ids) if currency_ids else {}
 
+        if args.explain_missing:
+            target_name, missing_item_name = args.explain_missing
+            report = build_explain_missing_report(
+                targets,
+                wallet,
+                item_counts,
+                legendary_armory,
+                item_names,
+                currency_names,
+                target_name,
+                missing_item_name,
+            )
+            print(report)
+
+            if args.output:
+                output_path = Path(args.output)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_text(report + "\n", encoding="utf-8")
+                print()
+                print(f"Report saved to {output_path}")
+
+            return 0
+
         if args.breakdown or args.breakdown_priority:
             report = build_breakdown_report(
                 targets,
@@ -4694,6 +5135,7 @@ def main() -> int:
                 currency_names,
                 target_name=args.breakdown,
                 use_priority=args.breakdown_priority,
+                show_paths=args.show_paths,
             )
             print(report)
 

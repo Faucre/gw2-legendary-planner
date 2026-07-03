@@ -982,9 +982,36 @@ class RecipeEngine:
         resolved_ingredients, ingredient_issues = self.resolve_wiki_ingredients(
             selected_recipe["ingredients"]
         )
+        ingredient_name_counts: dict[str, int] = {}
+
+        for ingredient in resolved_ingredients:
+            normalized_ingredient_name = normalize_item_name(str(ingredient.get("name", "")))
+
+            if not normalized_ingredient_name:
+                continue
+
+            ingredient_name_counts[normalized_ingredient_name] = (
+                ingredient_name_counts.get(normalized_ingredient_name, 0) + 1
+            )
+
+        duplicate_ingredient_names = sorted(
+            ingredient_name
+            for ingredient_name, count in ingredient_name_counts.items()
+            if count > 1
+        )
+
+        if duplicate_ingredient_names:
+            readable_duplicates = ", ".join(duplicate_ingredient_names)
+            ingredient_issues.append(
+                "Imported GW2 Wiki recipe data has duplicate ingredient names in one "
+                f"recipe ({readable_duplicates}). Review this page before fully trusting "
+                "the parsed quantities."
+            )
+
         summary["selected_recipe"] = selected_recipe
         summary["resolved_ingredients"] = resolved_ingredients
         summary["ingredient_issues"] = ingredient_issues
+        summary["duplicate_ingredient_names"] = duplicate_ingredient_names
 
         if len(options) > 1 and recipe_option_count == 1:
             summary["reason"] = (
@@ -1186,9 +1213,11 @@ class RecipeEngine:
         item_id: int,
         amount: int,
         reason: str,
+        item_path: list[int] | None = None,
     ) -> None:
         """Aggregate a terminal raw/material requirement."""
 
+        path_text = self.format_item_path(item_path or [])
         entry = self.raw_materials.setdefault(
             item_id,
             {
@@ -1196,9 +1225,13 @@ class RecipeEngine:
                 "name": self.item_name(item_id),
                 "amount": 0,
                 "reason": reason,
+                "paths": [],
             },
         )
         entry["amount"] += amount
+
+        if path_text and path_text not in entry["paths"]:
+            entry["paths"].append(path_text)
 
     def add_major_component(
         self,
@@ -1412,10 +1445,12 @@ class RecipeEngine:
         item_id: int,
         amount: int,
         wiki_summary: dict[str, Any],
+        item_path: list[int] | None = None,
     ) -> None:
         """Remember an account-bound/source item that was expanded from wiki data."""
 
         item_name = self.item_name(item_id)
+        path_text = self.format_item_path(item_path or [])
         source_step = self.manual_step_metadata(
             item_id,
             item_name,
@@ -1444,10 +1479,14 @@ class RecipeEngine:
                 "source_step_summary": source_step.get("source_step_summary", ""),
                 "source_parse_status": source_step.get("source_parse_status", ""),
                 "source_parse_reason": source_step.get("source_parse_reason", ""),
+                "paths": [],
             },
         )
         entry["amount"] += amount
         entry["ingredient_count"] = max(int(entry["ingredient_count"]), ingredient_count)
+
+        if path_text and path_text not in entry["paths"]:
+            entry["paths"].append(path_text)
 
     def apply_source_step_recipe(
         self,
@@ -1476,7 +1515,7 @@ class RecipeEngine:
 
         amount = remaining_amount
 
-        self.add_expanded_source_step(item_id, amount, wiki_summary)
+        self.add_expanded_source_step(item_id, amount, wiki_summary, current_path)
         self.record_resolution(
             item_id,
             "source_step_recipe",
@@ -1737,6 +1776,7 @@ class RecipeEngine:
                     amount,
                     "Account-bound item with no safe recipe expansion; count current "
                     "account storage toward this requirement.",
+                    item_path,
                 )
             self.add_manual_step(item_id, amount, reason, item_path)
             self.add_warning(f"{item_name}: {reason}")
@@ -1747,6 +1787,7 @@ class RecipeEngine:
             item_id,
             amount,
             "No official recipe found; treat as a terminal material.",
+            item_path,
         )
         self.record_resolution(
             item_id,
@@ -1900,6 +1941,7 @@ class RecipeEngine:
                     amount,
                     "Account-bound item with no safe recipe expansion; count current "
                     "account storage toward this requirement.",
+                    current_path,
                 )
             self.add_manual_step(item_id, amount, reason, current_path)
             self.record_resolution(
