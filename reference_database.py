@@ -228,6 +228,20 @@ def acquisition_type_from_heading(heading: str) -> str | None:
     return mapping.get(normalized_heading)
 
 
+def normal_report_source_type(acquisition_type: str | None) -> str:
+    """Map imported wiki option types to the small set shown in normal reports."""
+
+    normalized_type = str(acquisition_type or "").casefold()
+
+    if normalized_type in {"recipe", "vendor", "achievement", "collection", "mystic_forge"}:
+        return normalized_type
+
+    if normalized_type in {"reward", "container", "acquisition"}:
+        return normalized_type
+
+    return "unknown"
+
+
 def extract_acquisition_options_from_wikitext(wikitext: str) -> list[dict[str, Any]]:
     """Extract lightweight acquisition snippets from common wiki sections."""
 
@@ -247,8 +261,15 @@ def extract_acquisition_options_from_wikitext(wikitext: str) -> list[dict[str, A
         if not current_type:
             continue
 
-        if line.startswith("*") or line.startswith("#") or "{{Recipe" in line:
+        if line.startswith("{{Recipe"):
+            continue
+
+        if line.startswith("*") or line.startswith("#"):
             normalized_line = normalize_wiki_item_text(line)
+
+            if normalized_line["stripped_text"].startswith("{{"):
+                continue
+
             options.append(
                 {
                     "acquisition_type": current_type,
@@ -259,6 +280,269 @@ def extract_acquisition_options_from_wikitext(wikitext: str) -> list[dict[str, A
             )
 
     return options
+
+
+def extract_template_blocks(wikitext: str, template_name: str) -> list[str]:
+    """Extract top-level wiki template blocks by name."""
+
+    blocks: list[str] = []
+    current_block: list[str] = []
+    inside_template = False
+    brace_balance = 0
+    template_start = "{{" + template_name.casefold()
+
+    for raw_line in wikitext.splitlines():
+        line = raw_line.strip()
+        lower_line = line.casefold()
+        next_character = lower_line[len(template_start) : len(template_start) + 1]
+        is_requested_template = (
+            lower_line.startswith(template_start)
+            and next_character in {"", "|", "}"}
+        )
+
+        if not inside_template and is_requested_template:
+            inside_template = True
+            current_block = [line]
+            brace_balance = line.count("{{") - line.count("}}")
+
+            if brace_balance <= 0:
+                blocks.append("\n".join(current_block))
+                inside_template = False
+
+            continue
+
+        if not inside_template:
+            continue
+
+        current_block.append(line)
+        brace_balance += line.count("{{") - line.count("}}")
+
+        if brace_balance <= 0:
+            blocks.append("\n".join(current_block))
+            inside_template = False
+
+    return blocks
+
+
+def parse_template_fields(template_block: str) -> dict[str, str]:
+    """Parse simple | key = value lines from one wiki template block."""
+
+    fields: dict[str, str] = {}
+
+    for raw_line in template_block.splitlines():
+        line = raw_line.strip()
+
+        if not line.startswith("|"):
+            continue
+
+        key, separator, value = line[1:].partition("=")
+
+        if not separator:
+            continue
+
+        fields[key.strip().casefold()] = value.strip()
+
+    return fields
+
+
+def parse_source_step_ingredient(ingredient_text: str) -> dict[str, Any] | None:
+    """Parse a simple wiki recipe ingredient like '250 Glob of Ectoplasm'."""
+
+    original_text = str(ingredient_text).strip()
+    clean_text = " ".join(original_text.replace("\xa0", " ").split())
+
+    if not clean_text:
+        return None
+
+    match = re.match(r"^(?P<amount>\d[\d,]*)\s+(?P<name>.+)$", clean_text)
+
+    if not match:
+        return None
+
+    name_details = normalize_wiki_item_text(match.group("name").strip())
+    item_name = name_details["normalized_name"] or name_details["stripped_text"]
+
+    if not item_name or item_name.startswith("{{"):
+        return None
+
+    return {
+        "amount": int(match.group("amount").replace(",", "")),
+        "name": item_name,
+        "original_text": original_text,
+    }
+
+
+def parse_source_step_recipe_blocks(wikitext: str) -> list[dict[str, Any]]:
+    """Parse wiki {{Recipe}} blocks into source-step ingredient summaries."""
+
+    parsed_recipes: list[dict[str, Any]] = []
+
+    for block in extract_template_blocks(wikitext, "Recipe"):
+        fields = parse_template_fields(block)
+        ingredients: list[dict[str, Any]] = []
+
+        for key in sorted(fields):
+            if not re.fullmatch(r"ingredient\d+", key):
+                continue
+
+            ingredient = parse_source_step_ingredient(fields[key])
+
+            if ingredient:
+                ingredients.append(ingredient)
+
+        parsed_recipes.append(
+            {
+                "source_hint": fields.get("source", "").strip(),
+                "ingredients": ingredients,
+                "ingredient_count": len(ingredients),
+                "raw_template": block,
+            }
+        )
+
+    return parsed_recipes
+
+
+def summarize_recipe_ingredients(ingredients: list[dict[str, Any]]) -> str:
+    """Return a compact ingredient summary suitable for terminal output."""
+
+    if not ingredients:
+        return ""
+
+    parts = [
+        f"{ingredient['amount']:,} {ingredient['name']}"
+        for ingredient in ingredients[:8]
+    ]
+
+    if len(ingredients) > 8:
+        parts.append(f"and {len(ingredients) - 8:,} more")
+
+    return "Requires: " + ", ".join(parts)
+
+
+def source_step_data_from_wikitext(
+    wikitext: str,
+    options: list[dict[str, Any]],
+    missing: bool,
+) -> dict[str, Any]:
+    """Build normal-report source-step fields from one wiki page."""
+
+    if missing:
+        return {
+            "source_type": "unknown",
+            "source_step_summary": "Wiki page was not found; manual review needed.",
+            "parse_status": "page_missing",
+            "parse_reason": "The wiki API reported this page as missing.",
+            "parsed_recipe_ingredients": [],
+            "parsed_recipe_count": 0,
+        }
+
+    parsed_recipes = parse_source_step_recipe_blocks(wikitext)
+
+    if len(parsed_recipes) == 1 and parsed_recipes[0]["ingredients"]:
+        source_hint = normalize_item_name(parsed_recipes[0].get("source_hint", ""))
+        source_type = "mystic_forge" if "mystic forge" in source_hint else "recipe"
+        return {
+            "source_type": source_type,
+            "source_step_summary": summarize_recipe_ingredients(
+                parsed_recipes[0]["ingredients"]
+            ),
+            "parse_status": "parsed_recipe",
+            "parse_reason": "One structured {{Recipe}} block with ingredients was parsed.",
+            "parsed_recipe_ingredients": parsed_recipes[0]["ingredients"],
+            "parsed_recipe_count": 1,
+        }
+
+    if parsed_recipes:
+        return {
+            "source_type": "recipe",
+            "source_step_summary": "Wiki recipe/source data found, but it needs manual review.",
+            "parse_status": "manual_review_needed",
+            "parse_reason": (
+                "Recipe template data exists, but it did not contain one safely "
+                "parseable ingredient list."
+            ),
+            "parsed_recipe_ingredients": [],
+            "parsed_recipe_count": len(parsed_recipes),
+        }
+
+    source_type = "unknown"
+
+    if options:
+        source_type = normal_report_source_type(options[0].get("acquisition_type"))
+
+    summary = source_summary_from_acquisition_options(options)
+
+    if summary:
+        return {
+            "source_type": source_type,
+            "source_step_summary": summary,
+            "parse_status": "parsed_acquisition_option",
+            "parse_reason": "A wiki acquisition option was parsed.",
+            "parsed_recipe_ingredients": [],
+            "parsed_recipe_count": 0,
+        }
+
+    return {
+        "source_type": source_type,
+        "source_step_summary": "Wiki page found, but structured source data could not be parsed cleanly.",
+        "parse_status": "manual_review_needed",
+        "parse_reason": "No structured recipe or acquisition option was parsed.",
+        "parsed_recipe_ingredients": [],
+        "parsed_recipe_count": 0,
+    }
+
+
+def clean_wiki_summary_text(wiki_text: str) -> str:
+    """Turn a short wiki snippet into plain-ish terminal text."""
+
+    text = normalize_wiki_item_text(wiki_text)["stripped_text"]
+    text = re.sub(r"^\*+\s*", "", text)
+    text = re.sub(r"^#+\s*", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    if text.startswith("{{") or text.endswith("}}"):
+        return ""
+
+    return text
+
+
+def looks_like_raw_wiki_markup(text: str) -> bool:
+    """Return True for raw template snippets that should not be in reports."""
+
+    stripped_text = str(text).strip()
+    return stripped_text.startswith("{{") or "{{Recipe" in stripped_text
+
+
+def source_summary_from_acquisition_options(options: list[dict[str, Any]]) -> str:
+    """Choose a short, cautious source summary from parsed wiki options."""
+
+    if not options:
+        return ""
+
+    preferred_types = (
+        "recipe",
+        "mystic_forge",
+        "vendor",
+        "achievement",
+        "collection",
+        "reward",
+        "acquisition",
+    )
+
+    for preferred_type in preferred_types:
+        for option in options:
+            if option.get("acquisition_type") != preferred_type:
+                continue
+
+            text = clean_wiki_summary_text(
+                option.get("normalized_text") or option.get("text") or ""
+            )
+
+            if text:
+                return text[:240]
+
+    text = clean_wiki_summary_text(options[0].get("normalized_text") or options[0].get("text") or "")
+    return text[:240]
 
 
 class ReferenceDatabase:
@@ -665,6 +949,16 @@ class ReferenceDatabase:
                 missing = bool(page.get("missing"))
                 wikitext = "" if missing else extract_wiki_text(page)
                 options = extract_acquisition_options_from_wikitext(wikitext)
+                source_step_data = source_step_data_from_wikitext(
+                    wikitext,
+                    options,
+                    missing,
+                )
+                source_step_review_status = (
+                    "wiki_page_missing_manual_review_needed"
+                    if missing
+                    else "wiki_page_found_manual_review_needed"
+                )
                 raw_payload = {
                     "item_id": item_id,
                     "name": name,
@@ -673,6 +967,16 @@ class ReferenceDatabase:
                     "missing": missing,
                     "wikitext": wikitext,
                     "acquisition_options": options,
+                    "source_step_summary": source_step_data["source_step_summary"],
+                    "source_summary": source_step_data["source_step_summary"],
+                    "source_type": source_step_data["source_type"],
+                    "source_parse_status": source_step_data["parse_status"],
+                    "source_parse_reason": source_step_data["parse_reason"],
+                    "parsed_recipe_ingredients": source_step_data[
+                        "parsed_recipe_ingredients"
+                    ],
+                    "parsed_recipe_count": source_step_data["parsed_recipe_count"],
+                    "source_step_review_status": source_step_review_status,
                 }
                 recipe_key = f"wiki:{item_id}"
 
@@ -899,6 +1203,94 @@ class ReferenceDatabase:
             )
 
         return options
+
+    def source_step_for_item(self, item_id: int) -> dict[str, Any]:
+        """Return imported wiki source-step data for one manual item."""
+
+        rows = self.wiki_recipes_for_output(item_id)
+        options = self.acquisition_options_for_item(item_id)
+        primary_row = rows[0] if rows else {}
+        raw_payload = primary_row.get("raw_json", {}) if primary_row else {}
+        source_url = (
+            primary_row.get("source_url")
+            or raw_payload.get("source_url")
+            or wiki_page_url(str(raw_payload.get("name") or f"Item {item_id}"))
+        )
+        source_step_summary = str(
+            raw_payload.get("source_step_summary")
+            or raw_payload.get("source_summary", "")
+        ).strip()
+
+        if looks_like_raw_wiki_markup(source_step_summary):
+            source_step_summary = ""
+
+        source_type = str(raw_payload.get("source_type", "")).strip() or "unknown"
+        parse_status = str(raw_payload.get("source_parse_status", "")).strip()
+        parse_reason = str(raw_payload.get("source_parse_reason", "")).strip()
+        parsed_recipe_ingredients = list(raw_payload.get("parsed_recipe_ingredients", []))
+        parsed_recipe_count = int(raw_payload.get("parsed_recipe_count", 0))
+
+        if not source_step_summary and raw_payload.get("wikitext") is not None:
+            source_step_data = source_step_data_from_wikitext(
+                str(raw_payload.get("wikitext", "")),
+                [
+                    option.get("raw_json", {})
+                    for option in options
+                    if isinstance(option.get("raw_json", {}), dict)
+                ],
+                bool(raw_payload.get("missing", False)),
+            )
+            source_step_summary = source_step_data["source_step_summary"]
+            source_type = source_step_data["source_type"]
+            parse_status = source_step_data["parse_status"]
+            parse_reason = source_step_data["parse_reason"]
+            parsed_recipe_ingredients = source_step_data["parsed_recipe_ingredients"]
+            parsed_recipe_count = int(source_step_data["parsed_recipe_count"])
+
+        if not source_step_summary:
+            option_payloads = [
+                option.get("raw_json", {})
+                for option in options
+                if isinstance(option.get("raw_json", {}), dict)
+            ]
+            source_step_summary = source_summary_from_acquisition_options(option_payloads)
+
+        page_found = bool(rows and not raw_payload.get("missing", False))
+        review_status = str(
+            raw_payload.get("source_step_review_status")
+            or primary_row.get("review_status", "")
+            or "not_imported"
+        )
+        page_title = str(raw_payload.get("page_title", "")).strip()
+
+        if page_found and not source_step_summary:
+            source_step_summary = (
+                "Wiki page found, but structured source data could not be parsed cleanly."
+            )
+
+        if not parse_status and page_found:
+            parse_status = "manual_review_needed"
+
+        if not parse_reason and page_found:
+            parse_reason = "No structured source-step parser result was stored."
+
+        return {
+            "item_id": int(item_id),
+            "name": primary_row.get("name") or raw_payload.get("name") or f"Item {item_id}",
+            "source_url": source_url if rows else "",
+            "review_status": review_status,
+            "source_type": source_type,
+            "source_step_summary": source_step_summary,
+            "source_summary": source_step_summary,
+            "source_parse_status": parse_status,
+            "source_parse_reason": parse_reason,
+            "parsed_recipe_ingredients": parsed_recipe_ingredients,
+            "parsed_recipe_count": parsed_recipe_count,
+            "acquisition_option_count": len(options),
+            "wiki_page_found": page_found,
+            "wiki_rows_found": len(rows),
+            "raw_wiki_page_title": page_title,
+        }
 
     def status(self) -> dict[str, str]:
         """Return metadata and table counts for display."""

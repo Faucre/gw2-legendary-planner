@@ -2444,6 +2444,148 @@ def build_generate_missing_overrides_report(
     return "\n".join(lines).rstrip()
 
 
+def build_update_source_steps_report(
+    config_path: Path,
+    rebuild_item_index: bool = False,
+) -> str:
+    """Import targeted GW2 Wiki pages for current manual/source step items."""
+
+    validate_template_files(DEFAULT_TEMPLATES_DIR)
+    targets = resolve_targets_for_reference_update(
+        config_path,
+        rebuild_item_index=rebuild_item_index,
+    )
+
+    # Build the engine before creating a missing DB so it can still fall back to
+    # the legacy public API cache when the reference DB has not been set up yet.
+    recipe_engine = RecipeEngine()
+    wiki_items, wiki_warnings = collect_wiki_import_items_for_targets(
+        targets,
+        recipe_engine,
+    )
+    database = ReferenceDatabase(DEFAULT_REFERENCE_DB_PATH)
+    database.initialize_schema()
+    database.apply_overrides(Path("data") / "recipe_overrides.json")
+    wiki_counts = database.import_wiki_recipes_for_items(wiki_items)
+
+    lines = [
+        "Guild Wars 2 Planner Source Step Update",
+        "========================================",
+        f"Database: {DEFAULT_REFERENCE_DB_PATH}",
+        f"Source-step items checked: {len(wiki_items):,}",
+        f"Targeted wiki pages imported: {wiki_counts['wiki_pages']:,}",
+        f"Wiki acquisition options imported: {wiki_counts['acquisition_options']:,}",
+    ]
+
+    if wiki_items:
+        lines.append("")
+        lines.append("Imported source-step pages:")
+
+        for item in sorted(wiki_items, key=lambda row: row["name"]):
+            lines.append(f"  - {item['name']} (item_id {item['item_id']})")
+    else:
+        lines.append("")
+        lines.append("No source-step wiki pages needed for the current goals.")
+
+    if wiki_warnings:
+        lines.append("")
+        lines.append("Warnings:")
+        for warning in wiki_warnings:
+            lines.append(f"  - {warning}")
+
+    return "\n".join(lines).rstrip()
+
+
+def build_debug_source_step_report(
+    item_name: str,
+    rebuild_item_index: bool = False,
+) -> str:
+    """Show imported source-step data for one account-bound/manual item."""
+
+    cache = load_item_cache(DEFAULT_ITEM_CACHE_PATH)
+    reference_database = reference_database_if_available()
+    index: dict[str, Any] | None = None
+
+    if not reference_database:
+        index = ensure_item_name_index(
+            DEFAULT_ITEM_NAME_INDEX_PATH,
+            rebuild=rebuild_item_index,
+        )
+
+    resolved_item, warnings = validation_item_lookup(
+        item_name,
+        cache,
+        DEFAULT_ITEM_CACHE_PATH,
+        index,
+        "Source-step item",
+        reference_database=reference_database,
+    )
+
+    lines = [
+        "Source Step Debug",
+        f"Requested item: {item_name}",
+    ]
+
+    if warnings:
+        lines.append("Lookup warnings:")
+        for warning in warnings:
+            lines.append(f"  - {warning}")
+
+    if not resolved_item:
+        lines.append("Could not resolve the requested item to one item ID.")
+        return "\n".join(lines)
+
+    item_id = int(resolved_item["item_id"])
+    resolved_name = str(resolved_item.get("name", item_name))
+    recipe_engine = RecipeEngine()
+    source_step = recipe_engine.source_step_summary_for_item(item_id, resolved_name)
+    wiki_summary = recipe_engine.wiki_recipe_summary_for_item(item_id, resolved_name)
+
+    lines.extend(
+        [
+            f"Item: {resolved_name} (item_id {item_id})",
+            f"Raw wiki page title: {source_step.get('raw_wiki_page_title') or 'n/a'}",
+            f"Wiki rows found: {source_step.get('wiki_rows_found', 0):,}",
+            f"Wiki page found: {'yes' if source_step.get('wiki_page_found') else 'no'}",
+            f"Detected source type: {source_step.get('source_type') or 'unknown'}",
+            f"Source URL: {source_step.get('source_url') or 'n/a'}",
+            f"Review status: {source_step.get('review_status') or 'n/a'}",
+            "Acquisition options found: "
+            f"{source_step.get('acquisition_option_count', 0):,}",
+            f"Source-step parse status: {source_step.get('source_parse_status') or 'n/a'}",
+            f"Source-step parse reason: {source_step.get('source_parse_reason') or 'n/a'}",
+            "Final normal-report summary: "
+            f"{source_step.get('source_step_summary') or source_step.get('source_summary') or 'not imported yet'}",
+            "",
+            "Recipe-like wiki data:",
+            f"  - parsed recipes: {wiki_summary.get('parsed_recipe_count', 0):,}",
+            f"  - selected for auto-expansion: "
+            f"{'yes' if wiki_summary.get('selected_recipe') else 'no'}",
+            f"  - reason: {wiki_summary.get('reason', 'n/a')}",
+        ]
+    )
+
+    parsed_ingredients = list(source_step.get("parsed_recipe_ingredients", []))
+
+    lines.append("")
+    lines.append("Parsed source-step recipe ingredients:")
+
+    if parsed_ingredients:
+        for ingredient in parsed_ingredients:
+            lines.append(f"  - {ingredient['amount']:,} {ingredient['name']}")
+    else:
+        lines.append("  - none")
+
+    if not source_step.get("wiki_rows_found"):
+        lines.append("")
+        lines.append(
+            "Run python gw2_legendary_planner.py --update-source-steps "
+            "to import targeted wiki source-step pages."
+        )
+
+    return "\n".join(lines).rstrip()
+
+
 def build_reference_db_setup_report(
     config_path: Path,
     update: bool = False,
@@ -2717,11 +2859,31 @@ def is_named_item(missing_entry: dict[str, Any], item_name: str) -> bool:
     return normalize_item_name(missing_entry["name"]) == normalize_item_name(item_name)
 
 
+def missing_item_by_name(
+    missing_items: list[dict[str, Any]],
+    item_name: str,
+) -> dict[str, Any] | None:
+    """Find one missing item by exact normalized name."""
+
+    for item in missing_items:
+        if is_named_item(item, item_name):
+            return item
+
+    return None
+
+
 def is_provisioners_token(missing_entry: dict[str, Any]) -> bool:
     """Check whether a missing item looks like a Provisioner's Token."""
 
     normalized_name = normalize_item_name(missing_entry["name"])
     return "provisioner" in normalized_name and "token" in normalized_name
+
+
+def is_precursor_step(missing_entry: dict[str, Any]) -> bool:
+    """Check for known precursor-style items in expanded legendary trees."""
+
+    normalized_name = normalize_item_name(missing_entry["name"])
+    return "precursor" in normalized_name or normalized_name in {"nyr hrammr"}
 
 
 def is_obsidian_armor_essence(
@@ -2787,8 +2949,34 @@ def build_rule_recommendations(
             "and check weekly vendor sources."
         )
 
+    if missing_item_by_name(missing_items, "Mystic Runestone"):
+        recommendations.append(
+            "Mystic Runestone: check the source-step/vendor path before treating it "
+            "like a generic material."
+        )
+
+    if missing_item_by_name(missing_items, "Bloodstone Shard"):
+        recommendations.append(
+            "Bloodstone Shard: check your Spirit Shards and Mystic Forge vendor access."
+        )
+
+    if missing_item_by_name(missing_items, "Gift of Research"):
+        recommendations.append(
+            "Source step: Gift of Research needs research notes; review that branch before buying."
+        )
+
+    if missing_item_by_name(missing_items, "Gift of the Mists"):
+        recommendations.append("Source step: Gift of the Mists is still needed; review that branch.")
+
     if any(is_named_item(item, "Gift of Battle") for item in missing_items):
         recommendations.append("Gift of Battle: put today's play time into WvW reward track progress.")
+
+    precursor_items = [item for item in missing_items if is_precursor_step(item)]
+
+    for precursor in precursor_items[:1]:
+        recommendations.append(
+            f"Precursor step: {precursor['name']} is still needed for final assembly."
+        )
 
     if any(is_provisioners_token(item) for item in missing_items):
         recommendations.append(
@@ -3105,6 +3293,7 @@ def make_recipe_engine_lines(target: dict[str, Any], detailed: bool = False) -> 
     warnings = list(target.get(RECIPE_ENGINE_WARNINGS_FIELD, []))
     manual_steps = list(target.get(RECIPE_UNKNOWN_STEPS_FIELD, []))
     auto_materials = list(target.get(AUTO_RECIPE_MATERIALS_FIELD, []))
+    expanded_source_steps = list(recipe_tree.get("expanded_source_steps", [])) if recipe_tree else []
 
     if not recipe_tree and not warnings and not manual_steps:
         if detailed:
@@ -3124,15 +3313,17 @@ def make_recipe_engine_lines(target: dict[str, Any], detailed: bool = False) -> 
             f"craftable ingredient types found: {len(craftable_ingredients):,}."
         )
 
-        if wiki_sources:
+        if detailed and wiki_sources:
             lines.append("    GW2 Wiki fallback data used:")
             for wiki_source in wiki_sources:
+                option_count = int(wiki_source.get("acquisition_option_count", 0))
                 lines.append(
                     f"      - {wiki_source['name']}: source {wiki_source['source']}; "
                     f"review_status {wiki_source['review_status'] or 'n/a'}; "
-                    f"multiple acquisition options "
-                    f"{'yes' if wiki_source['multiple_acquisition_options'] else 'no'}."
+                    f"acquisition options found {option_count:,}."
                 )
+                if wiki_source.get("multiple_acquisition_options"):
+                    lines.append("        Multiple acquisition options need review.")
                 if wiki_source.get("source_url"):
                     lines.append(f"        Source URL: {wiki_source['source_url']}")
 
@@ -3144,19 +3335,78 @@ def make_recipe_engine_lines(target: dict[str, Any], detailed: bool = False) -> 
                         f"      - {ingredient['name']}: {ingredient['amount']:,} "
                         "via GW2 Wiki recipe data"
                     )
+                elif ingredient.get("recipe_source") == "source_step_wiki":
+                    lines.append(
+                        f"      - {ingredient['name']}: {ingredient['amount']:,} "
+                        "via expanded source-step wiki recipe"
+                    )
                 else:
                     lines.append(
                         f"      - {ingredient['name']}: {ingredient['amount']:,} "
                         f"via recipe {ingredient['recipe_id']}"
                     )
 
+    if expanded_source_steps:
+        lines.append("    Source-step recipes expanded:")
+        for source_step in expanded_source_steps:
+            lines.append(
+                f"      - {source_step['name']}: {source_step['amount']:,} needed; "
+                f"expanded {source_step['ingredient_count']:,} ingredients."
+            )
+            if source_step.get("source_step_summary"):
+                lines.append(f"        Summary: {source_step['source_step_summary']}")
+            if source_step.get("source_url"):
+                lines.append(f"        Source URL: {source_step['source_url']}")
+
+    if detailed and recipe_tree and recipe_tree.get("debug_events"):
+        lines.append("    Debug:")
+        for event in recipe_tree["debug_events"]:
+            lines.append(f"      - {event}")
+
     if manual_steps:
         lines.append("    Manual/source steps still needed:")
         for manual_step in manual_steps:
             lines.append(
-                f"      - {manual_step['name']}: {manual_step['amount']:,} needed. "
-                f"{manual_step['reason']}"
+                f"      - {manual_step['name']}: {manual_step['amount']:,} needed."
             )
+            source_url = str(manual_step.get("source_url", "")).strip()
+            review_status = str(manual_step.get("review_status", "")).strip()
+            source_type = str(manual_step.get("source_type", "unknown")).strip()
+            source_summary = str(
+                manual_step.get("source_step_summary")
+                or manual_step.get("source_summary", "")
+            ).strip()
+            acquisition_option_count = int(
+                manual_step.get("acquisition_option_count", 0)
+            )
+
+            if source_url or manual_step.get("wiki_page_found"):
+                lines.append("        Source: GW2 Wiki")
+
+            if source_type and source_type != "unknown":
+                lines.append(f"        Type: {source_type}")
+
+            if source_summary:
+                lines.append(f"        Summary: {source_summary}")
+            elif manual_step.get("wiki_page_found"):
+                lines.append(
+                    "        Summary: Wiki page found, but structured source data "
+                    "could not be parsed cleanly."
+                )
+
+            if acquisition_option_count:
+                lines.append(
+                    f"        Acquisition options found: {acquisition_option_count:,}"
+                )
+
+            if review_status and review_status != "not_imported":
+                lines.append(f"        Review status: {review_status}")
+
+            if source_url:
+                lines.append(f"        Source URL: {source_url}")
+
+            if detailed and manual_step.get("reason"):
+                lines.append(f"        Notes: {manual_step['reason']}")
 
     if warnings:
         lines.append("    Warnings:")
@@ -3380,13 +3630,16 @@ def build_gameplay_recommendations(
     if not recommendations and (
         target_status["missing_items"] or target_status["missing_currencies"]
     ):
-        biggest_missing = sorted(
+        biggest_missing_entries = sorted(
             target_status["missing_items"] + target_status["missing_currencies"],
             key=lambda entry: entry["missing"],
             reverse=True,
-        )[0]
+        )[:3]
+        missing_names = ", ".join(entry["name"] for entry in biggest_missing_entries)
         recommendations.append(
-            f"No special daily rule matched. Work on {biggest_missing['name']} first."
+            "Next recipe branch: work the highest-priority missing entries now showing "
+            f"in the tree: {missing_names}. If one is account-bound, use its source-step "
+            "notes; otherwise gather, craft, or buy the normal materials as needed."
         )
 
     return recommendations
@@ -3734,6 +3987,11 @@ def parse_args() -> argparse.Namespace:
         help="Refresh the local public reference database from official API data.",
     )
     parser.add_argument(
+        "--update-source-steps",
+        action="store_true",
+        help="Import targeted GW2 Wiki source-step pages for manual recipe items.",
+    )
+    parser.add_argument(
         "--reference-db-status",
         action="store_true",
         help="Show local public reference database status.",
@@ -3742,6 +4000,11 @@ def parse_args() -> argparse.Namespace:
         "--debug-recipe-source",
         default=None,
         help="Explain which recipe source the engine would choose for one item name.",
+    )
+    parser.add_argument(
+        "--debug-source-step",
+        default=None,
+        help="Show imported source-step data for one account-bound/manual item.",
     )
     parser.add_argument(
         "--debug-wiki-name",
@@ -3834,6 +4097,15 @@ def main() -> int:
             )
             return 0
 
+        if args.update_source_steps:
+            print(
+                build_update_source_steps_report(
+                    Path(args.config),
+                    rebuild_item_index=args.rebuild_item_index,
+                )
+            )
+            return 0
+
         if args.reference_db_status:
             print(build_reference_db_status_report())
             return 0
@@ -3842,6 +4114,15 @@ def main() -> int:
             print(
                 build_debug_recipe_source_report(
                     args.debug_recipe_source,
+                    rebuild_item_index=args.rebuild_item_index,
+                )
+            )
+            return 0
+
+        if args.debug_source_step:
+            print(
+                build_debug_source_step_report(
+                    args.debug_source_step,
                     rebuild_item_index=args.rebuild_item_index,
                 )
             )

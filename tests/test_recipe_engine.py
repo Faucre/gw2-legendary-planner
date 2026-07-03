@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
-import tempfile
 import time
 import unittest
+import uuid
 from pathlib import Path
 
 from gw2_legendary_planner import (
@@ -12,6 +12,7 @@ from gw2_legendary_planner import (
     RECIPE_ENGINE_WARNINGS_FIELD,
     RECIPE_TREE_FIELD,
     RECIPE_UNKNOWN_STEPS_FIELD,
+    build_rule_recommendations,
     build_target_status,
     make_recipe_engine_lines,
     recipe_tree_to_material_entries,
@@ -20,13 +21,19 @@ from recipe_engine import RecipeEngine
 from reference_database import ReferenceDatabase, normalize_wiki_item_text
 
 
-def insert_item(connection: sqlite3.Connection, item_id: int, name: str) -> None:
+def insert_item(
+    connection: sqlite3.Connection,
+    item_id: int,
+    name: str,
+    flags: list[str] | None = None,
+) -> None:
     now = int(time.time())
+    normalized_flags = flags or []
     raw_json = json.dumps(
         {
             "id": item_id,
             "name": name,
-            "flags": [],
+            "flags": normalized_flags,
         },
         sort_keys=True,
     )
@@ -34,9 +41,9 @@ def insert_item(connection: sqlite3.Connection, item_id: int, name: str) -> None
         """
         INSERT INTO items
             (item_id, name, type, rarity, flags_json, raw_json, source, updated_at)
-        VALUES (?, ?, '', '', '[]', ?, 'official_api', ?)
+        VALUES (?, ?, '', '', ?, ?, 'official_api', ?)
         """,
-        (item_id, name, raw_json, now),
+        (item_id, name, json.dumps(normalized_flags, sort_keys=True), raw_json, now),
     )
     connection.execute(
         """
@@ -122,8 +129,10 @@ def insert_acquisition_option(
 
 class RecipeEngineWikiFallbackTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temp_dir = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp_dir.name)
+        test_temp_root = Path.cwd() / "reports" / "test-temp"
+        test_temp_root.mkdir(parents=True, exist_ok=True)
+        self.root = test_temp_root / uuid.uuid4().hex
+        self.root.mkdir(parents=True, exist_ok=True)
         self.reference_db_path = self.root / "planner_reference.sqlite"
         self.overrides_path = self.root / "recipe_overrides.json"
         self.reference_database = ReferenceDatabase(self.reference_db_path)
@@ -154,7 +163,7 @@ class RecipeEngineWikiFallbackTests(unittest.TestCase):
             connection.close()
 
     def tearDown(self) -> None:
-        self.temp_dir.cleanup()
+        pass
 
     def make_engine(self) -> RecipeEngine:
         return RecipeEngine(
@@ -230,11 +239,11 @@ class RecipeEngineWikiFallbackTests(unittest.TestCase):
             RECIPE_ENGINE_WARNINGS_FIELD: [],
             RECIPE_UNKNOWN_STEPS_FIELD: list(tree["unknown_manual_steps"]),
         }
-        report_lines = make_recipe_engine_lines(target)
+        report_lines = make_recipe_engine_lines(target, detailed=True)
         self.assertTrue(any("GW2 Wiki" in line for line in report_lines))
         self.assertTrue(any(self.source_url in line for line in report_lines))
 
-    def test_manual_override_without_ingredients_still_stops(self) -> None:
+    def test_manual_override_with_clear_wiki_recipe_expands(self) -> None:
         connection = self.reference_database.connect()
         try:
             insert_wiki_recipe(
@@ -270,9 +279,201 @@ class RecipeEngineWikiFallbackTests(unittest.TestCase):
         engine = self.make_engine()
         tree = engine.resolve_recipe_tree(self.root_item_id)
 
-        self.assertEqual(tree["final_source"]["source"], "override_manual_stop")
+        self.assertEqual(tree["final_source"]["source"], "source_step_recipe")
+        self.assertEqual(
+            {(row["item_id"], row["amount"]) for row in tree["raw_material_requirements"]},
+            {(2000, 1), (2001, 2)},
+        )
+        self.assertEqual(tree["unknown_manual_steps"], [])
+        self.assertEqual(len(tree["expanded_source_steps"]), 1)
+        self.assertTrue(
+            any(
+                "Expanded source-step recipe: Legendary Spear -> 2 ingredients" == event
+                for event in tree["debug_events"]
+            )
+        )
+
+    def test_plural_wiki_ingredient_resolves_to_singular_item_name(self) -> None:
+        plural_wikitext = "\n".join(
+            [
+                "== Acquisition ==",
+                "=== Recipe ===",
+                "{{Recipe",
+                "| source = Mystic Forge",
+                "| ingredient1 = 38 Mystic Clovers",
+                "}}",
+            ]
+        )
+        connection = self.reference_database.connect()
+        try:
+            insert_item(connection, 2002, "Mystic Clover")
+            insert_wiki_recipe(
+                connection,
+                self.root_item_id,
+                self.root_item_name,
+                plural_wikitext,
+                source_url=self.source_url,
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        self.write_overrides(
+            [
+                {
+                    "item_id": self.root_item_id,
+                    "name": self.root_item_name,
+                    "type": "manual",
+                    "verified": False,
+                    "ingredients": [],
+                }
+            ]
+        )
+
+        engine = self.make_engine()
+        tree = engine.resolve_recipe_tree(self.root_item_id)
+
+        self.assertEqual(
+            {(row["item_id"], row["amount"]) for row in tree["raw_material_requirements"]},
+            {(2002, 38)},
+        )
+        self.assertEqual(tree["unknown_manual_steps"], [])
+
+    def test_account_bound_terminal_child_is_counted_and_kept_as_manual_step(self) -> None:
+        connection = self.reference_database.connect()
+        try:
+            insert_item(connection, 4000, "Account Gift", flags=["AccountBound"])
+            connection.commit()
+        finally:
+            connection.close()
+
+        self.write_overrides(
+            [
+                {
+                    "item_id": self.root_item_id,
+                    "name": self.root_item_name,
+                    "type": "manual",
+                    "verified": True,
+                    "ingredients": [
+                        {
+                            "item_id": 4000,
+                            "name": "Account Gift",
+                            "amount": 3,
+                        }
+                    ],
+                }
+            ]
+        )
+
+        engine = self.make_engine()
+        tree = engine.resolve_recipe_tree(self.root_item_id)
+
+        self.assertEqual(
+            {(row["item_id"], row["amount"]) for row in tree["raw_material_requirements"]},
+            {(4000, 3)},
+        )
         self.assertEqual(len(tree["unknown_manual_steps"]), 1)
-        self.assertEqual(tree["wiki_sources_used"], [])
+        self.assertEqual(tree["unknown_manual_steps"][0]["item_id"], 4000)
+
+    def test_manual_source_step_uses_imported_wiki_metadata(self) -> None:
+        connection = self.reference_database.connect()
+        try:
+            insert_wiki_recipe(
+                connection,
+                self.root_item_id,
+                self.root_item_name,
+                self.wikitext,
+                source_url=self.source_url,
+            )
+            insert_acquisition_option(
+                connection,
+                self.root_item_id,
+                "achievement",
+                self.source_url,
+                "* Complete the related legendary collection achievement.",
+                heading="Achievements",
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        self.write_overrides(
+            [
+                {
+                    "item_id": self.root_item_id,
+                    "name": self.root_item_name,
+                    "type": "manual",
+                    "verified": False,
+                    "ingredients": [],
+                }
+            ]
+        )
+
+        engine = self.make_engine()
+        tree = engine.resolve_recipe_tree(self.root_item_id)
+        expanded_step = tree["expanded_source_steps"][0]
+
+        self.assertEqual(tree["unknown_manual_steps"], [])
+        self.assertEqual(
+            {(row["item_id"], row["amount"]) for row in tree["raw_material_requirements"]},
+            {(2000, 1), (2001, 2)},
+        )
+        self.assertEqual(expanded_step["source_url"], self.source_url)
+        self.assertEqual(expanded_step["review_status"], "wiki_imported_unreviewed")
+        self.assertEqual(expanded_step["source_type"], "mystic_forge")
+        self.assertEqual(expanded_step["acquisition_option_count"], 1)
+        self.assertIn("Gift of Frost", expanded_step["source_step_summary"])
+        self.assertNotIn("{{Recipe", expanded_step["source_step_summary"])
+        self.assertEqual(expanded_step["ingredient_count"], 2)
+
+        target = {
+            RECIPE_TREE_FIELD: tree,
+            RECIPE_UNKNOWN_STEPS_FIELD: list(tree["unknown_manual_steps"]),
+            RECIPE_ENGINE_WARNINGS_FIELD: [],
+            AUTO_RECIPE_MATERIALS_FIELD: recipe_tree_to_material_entries(tree),
+        }
+        report_lines = make_recipe_engine_lines(target, detailed=True)
+
+        self.assertTrue(any("Source URL:" in line for line in report_lines))
+        self.assertTrue(any("Summary:" in line for line in report_lines))
+        self.assertTrue(any("Source-step recipes expanded:" in line for line in report_lines))
+        self.assertFalse(any("{{Recipe" in line for line in report_lines))
+
+    def test_unparseable_source_step_recipe_shows_manual_review_message(self) -> None:
+        connection = self.reference_database.connect()
+        try:
+            insert_wiki_recipe(
+                connection,
+                self.root_item_id,
+                self.root_item_name,
+                "{{Recipe\n| source = Mystic Forge\n}}",
+                source_url=self.source_url,
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        self.write_overrides(
+            [
+                {
+                    "item_id": self.root_item_id,
+                    "name": self.root_item_name,
+                    "type": "manual",
+                    "verified": False,
+                    "ingredients": [],
+                }
+            ]
+        )
+
+        engine = self.make_engine()
+        tree = engine.resolve_recipe_tree(self.root_item_id)
+        manual_step = tree["unknown_manual_steps"][0]
+
+        self.assertEqual(
+            manual_step["source_step_summary"],
+            "Wiki recipe/source data found, but it needs manual review.",
+        )
+        self.assertNotIn("{{Recipe", manual_step["source_step_summary"])
 
     def test_multiple_wiki_recipe_options_warn_instead_of_picking(self) -> None:
         connection = self.reference_database.connect()
@@ -388,6 +589,32 @@ class RecipeEngineWikiFallbackTests(unittest.TestCase):
 
         self.assertEqual(status["status_label"], "Partially resolved")
         self.assertEqual(status["steps"], [])
+
+    def test_recommendations_use_expanded_klobjarne_items(self) -> None:
+        missing_items = [
+            {"id": 1, "name": "Mystic Clover", "missing": 38},
+            {"id": 2, "name": "Mystic Runestone", "missing": 100},
+            {"id": 3, "name": "Bloodstone Shard", "missing": 1},
+            {"id": 4, "name": "Gift of Research", "missing": 1},
+            {"id": 5, "name": "Gift of the Mists", "missing": 1},
+            {"id": 6, "name": "Nyr Hrammr", "missing": 1},
+        ]
+
+        recommendations = build_rule_recommendations(
+            "Klobjarne Geirr",
+            missing_items,
+            [],
+            None,
+        )
+
+        recommendation_text = "\n".join(recommendations)
+        self.assertIn("Mystic Clover: do Wizard's Vault", recommendation_text)
+        self.assertIn("Mystic Runestone: check the source-step/vendor path", recommendation_text)
+        self.assertIn("Bloodstone Shard: check your Spirit Shards", recommendation_text)
+        self.assertIn("Source step: Gift of Research", recommendation_text)
+        self.assertIn("research notes", recommendation_text)
+        self.assertIn("Source step: Gift of the Mists", recommendation_text)
+        self.assertIn("Precursor step: Nyr Hrammr", recommendation_text)
 
 
 if __name__ == "__main__":

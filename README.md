@@ -100,12 +100,14 @@ To build or refresh the local public reference database:
 ```bash
 python gw2_legendary_planner.py --setup-reference-db
 python gw2_legendary_planner.py --update-reference-db
+python gw2_legendary_planner.py --update-source-steps
 python gw2_legendary_planner.py --reference-db-status
 python gw2_legendary_planner.py --debug-recipe-source "Klobjarne Geirr"
+python gw2_legendary_planner.py --debug-source-step "Gift of Janthir Wilds"
 python gw2_legendary_planner.py --debug-wiki-name "Dragon's Claw (weapon)|Dragon's Claw"
 ```
 
-Normal planner runs use `data/planner_reference.sqlite` when it exists. Setup/update commands fetch public item and recipe data, build lookup tables, apply `data/recipe_overrides.json`, then import targeted wiki data only for configured targets that still have no official recipe or verified override ingredients. Account-specific caches stay separate.
+Normal planner runs use `data/planner_reference.sqlite` when it exists. Setup/update commands fetch public item and recipe data, build lookup tables, apply `data/recipe_overrides.json`, then import targeted wiki data only for configured targets that still have no official recipe or verified override ingredients. `--update-source-steps` refreshes just the targeted wiki source-step pages for current manual/account-bound recipe gaps. Account-specific caches stay separate.
 
 The report includes a `Recommended today` section. It looks at the first incomplete enabled target first, separates gameplay recommendations from configuration/TODO recommendations, then gives shorter secondary notes for later targets.
 
@@ -135,6 +137,8 @@ Normal runs now use imported wiki recipe data as a fallback only when:
 Verified override ingredients still win first. Manual/account-bound/time-gated style overrides with no ingredients still stop automatic expansion immediately. Unverified empty `mystic_forge` override stubs are treated as review placeholders instead of hard stops, so they no longer block imported wiki data.
 
 If imported wiki data has multiple acquisition options and no single recipe option is clearly marked, the planner refuses to guess and adds a warning/manual recipe gap instead.
+
+Manual/account-bound recipe gaps are shown as source steps. When source-step wiki data has been imported, each step can show the item name, amount needed, source URL, review status, short source summary, and acquisition-option count. If the wiki page exists but is not structured clearly enough, the app reports `wiki page found, manual review needed` instead of expanding uncertain achievement or collection requirements.
 
 Automatic resolution stops and adds a warning instead of guessing when:
 

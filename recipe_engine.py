@@ -189,6 +189,33 @@ def normalize_item_name(item_name: str) -> str:
     return " ".join(item_name.casefold().split())
 
 
+def wiki_item_name_candidates(item_name: str) -> list[str]:
+    """Return safe name variants for wiki ingredient text.
+
+    The wiki sometimes writes normal plural text such as "Mystic Clovers", while
+    the official item name is singular. These fallbacks only help if the local
+    reference database finds exactly one matching item.
+    """
+
+    clean_name = " ".join(str(item_name).strip().split())
+    candidates: list[str] = []
+
+    if clean_name:
+        candidates.append(clean_name)
+
+    if len(clean_name) > 4 and clean_name.endswith("ies"):
+        candidates.append(clean_name[:-3] + "y")
+    elif len(clean_name) > 3 and clean_name.endswith("s") and not clean_name.endswith("ss"):
+        candidates.append(clean_name[:-1])
+
+    unique_candidates: list[str] = []
+    for candidate in candidates:
+        if candidate not in unique_candidates:
+            unique_candidates.append(candidate)
+
+    return unique_candidates
+
+
 def parse_wiki_ingredient_text(ingredient_text: str) -> dict[str, Any] | None:
     """Parse a simple wiki recipe ingredient line like '1 Gift of Battle'."""
 
@@ -212,7 +239,11 @@ def parse_wiki_ingredient_text(ingredient_text: str) -> dict[str, Any] | None:
         "original_wiki_name": match.group("name").strip(),
         "wiki_page_title": name_details["page_title"],
         "wiki_display_text": name_details["display_text"],
-        "wiki_name_candidates": name_details["candidates"],
+        "wiki_name_candidates": [
+            candidate
+            for name in name_details["candidates"]
+            for candidate in wiki_item_name_candidates(name)
+        ],
     }
 
 
@@ -513,10 +544,12 @@ class RecipeEngine:
         self.raw_materials: dict[int, dict[str, Any]] = {}
         self.craftable_ingredients: dict[int, dict[str, Any]] = {}
         self.manual_steps: dict[str, dict[str, Any]] = {}
+        self.expanded_source_steps: dict[int, dict[str, Any]] = {}
         self.recipes_used: dict[int, dict[str, Any]] = {}
         self.resolution_log: dict[int, dict[str, Any]] = {}
         self.wiki_sources_used: dict[int, dict[str, Any]] = {}
         self.warnings: list[str] = []
+        self.debug_events: list[str] = []
 
     def save_cache(self) -> None:
         """Persist the official API cache."""
@@ -999,6 +1032,63 @@ class RecipeEngine:
             "selection_reason": selection_reason,
         }
 
+    def source_step_summary_for_item(
+        self,
+        item_id: int,
+        item_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Return imported wiki source-step data for a manual item, if available."""
+
+        resolved_name = item_name or self.item_name(item_id)
+        empty_summary = {
+            "item_id": int(item_id),
+            "name": resolved_name,
+            "source_url": "",
+            "review_status": "not_imported",
+            "source_type": "unknown",
+            "source_step_summary": "",
+            "source_summary": "",
+            "source_parse_status": "",
+            "source_parse_reason": "",
+            "parsed_recipe_ingredients": [],
+            "parsed_recipe_count": 0,
+            "acquisition_option_count": 0,
+            "wiki_page_found": False,
+            "wiki_rows_found": 0,
+            "raw_wiki_page_title": "",
+        }
+
+        if not self.using_reference_database:
+            return empty_summary
+
+        summary = self.reference_database.source_step_for_item(item_id)
+
+        if not summary.get("name"):
+            summary["name"] = resolved_name
+
+        return {**empty_summary, **summary}
+
+    def manual_step_metadata(
+        self,
+        item_id: int,
+        item_name: str,
+        source_step: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Build source-step metadata for reportable manual recipe stops."""
+
+        metadata = source_step or self.source_step_summary_for_item(item_id, item_name)
+
+        if metadata.get("source_step_summary") and not metadata.get("source_summary"):
+            metadata["source_summary"] = metadata["source_step_summary"]
+
+        if metadata.get("wiki_page_found") and not metadata.get("source_summary"):
+            metadata["source_summary"] = (
+                "Wiki page found, but structured source data could not be parsed cleanly."
+            )
+            metadata["source_step_summary"] = metadata["source_summary"]
+
+        return metadata
+
     def apply_override(
         self,
         item_id: int,
@@ -1193,28 +1283,215 @@ class RecipeEngine:
                 max_depth,
             )
 
+    def add_expanded_source_step(
+        self,
+        item_id: int,
+        amount: int,
+        wiki_summary: dict[str, Any],
+    ) -> None:
+        """Remember an account-bound/source item that was expanded from wiki data."""
+
+        item_name = self.item_name(item_id)
+        source_step = self.manual_step_metadata(
+            item_id,
+            item_name,
+            self.source_step_summary_for_item(item_id, item_name),
+        )
+        ingredient_count = len(wiki_summary.get("resolved_ingredients", []))
+        entry = self.expanded_source_steps.setdefault(
+            item_id,
+            {
+                "item_id": item_id,
+                "name": item_name,
+                "amount": 0,
+                "ingredient_count": ingredient_count,
+                "source_url": source_step.get("source_url", wiki_summary.get("source_url", "")),
+                "review_status": source_step.get(
+                    "review_status",
+                    wiki_summary.get("review_status", ""),
+                ),
+                "source_type": source_step.get("source_type", "recipe"),
+                "acquisition_option_count": int(
+                    source_step.get(
+                        "acquisition_option_count",
+                        wiki_summary.get("acquisition_option_count", 0),
+                    )
+                ),
+                "source_step_summary": source_step.get("source_step_summary", ""),
+                "source_parse_status": source_step.get("source_parse_status", ""),
+                "source_parse_reason": source_step.get("source_parse_reason", ""),
+            },
+        )
+        entry["amount"] += amount
+        entry["ingredient_count"] = max(int(entry["ingredient_count"]), ingredient_count)
+
+    def apply_source_step_recipe(
+        self,
+        item_id: int,
+        amount: int,
+        wiki_summary: dict[str, Any],
+        current_path: list[int],
+        active_item_ids: set[int],
+        depth: int,
+        max_depth: int,
+    ) -> None:
+        """Expand one manual/source step that has one clear parsed wiki recipe."""
+
+        item_name = self.item_name(item_id)
+        resolved_ingredients = list(wiki_summary.get("resolved_ingredients", []))
+        ingredient_count = len(resolved_ingredients)
+        selection_reason = str(wiki_summary.get("reason", ""))
+
+        self.add_expanded_source_step(item_id, amount, wiki_summary)
+        self.record_resolution(
+            item_id,
+            "source_step_recipe",
+            selection_reason
+            or "A clear source-step wiki recipe was expanded recursively.",
+            source_url=wiki_summary.get("source_url", ""),
+            review_status=wiki_summary.get("review_status", ""),
+            acquisition_option_count=int(wiki_summary.get("acquisition_option_count", 0)),
+            ingredient_count=ingredient_count,
+        )
+        self.record_wiki_source_usage(
+            item_id,
+            item_name,
+            wiki_summary,
+            used_for_recipe=True,
+            selection_reason=selection_reason,
+        )
+
+        debug_event = (
+            f"Expanded source-step recipe: {item_name} -> {ingredient_count:,} ingredients"
+        )
+        self.debug_events.append(debug_event)
+
+        for issue in wiki_summary.get("ingredient_issues", []):
+            self.add_warning(f"{item_name}: {issue}")
+
+        if depth > 0:
+            self.craftable_ingredients.setdefault(
+                item_id,
+                {
+                    "item_id": item_id,
+                    "name": item_name,
+                    "amount": 0,
+                    "recipe_id": None,
+                    "craft_count": 0,
+                    "recipe_source": "source_step_wiki",
+                    "review_status": wiki_summary.get("review_status", ""),
+                    "source_url": wiki_summary.get("source_url", ""),
+                },
+            )
+            self.craftable_ingredients[item_id]["amount"] += amount
+            self.craftable_ingredients[item_id]["craft_count"] += amount
+
+        craft_count = max(int(amount), 1)
+        next_active_item_ids = set(active_item_ids)
+        next_active_item_ids.add(item_id)
+
+        for ingredient in resolved_ingredients:
+            ingredient_item_id = ingredient.get("item_id")
+            ingredient_amount = int(ingredient["amount"]) * craft_count
+
+            if ingredient_item_id is None:
+                ingredient_name = ingredient.get("name") or "Unnamed source-step ingredient"
+                reason = (
+                    f"Source-step wiki recipe data for {item_name} includes "
+                    f"'{ingredient_name}' by name only. Add a verified override before "
+                    "the app can resolve it safely."
+                )
+                self.add_manual_step(item_id, amount, reason, current_path)
+                self.add_warning(reason)
+                continue
+
+            self.resolve_item(
+                int(ingredient_item_id),
+                ingredient_amount,
+                depth + 1,
+                current_path,
+                next_active_item_ids,
+                max_depth,
+            )
+
     def add_manual_step(
         self,
         item_id: int,
         amount: int,
         reason: str,
         item_path: list[int],
+        source_step: dict[str, Any] | None = None,
     ) -> None:
         """Aggregate unknown or manually tracked recipe gaps."""
 
         key = f"{item_id}:{reason}"
         path_text = self.format_item_path(item_path)
+        item_name = self.item_name(item_id)
+        metadata = self.manual_step_metadata(item_id, item_name, source_step)
         entry = self.manual_steps.setdefault(
             key,
             {
                 "item_id": item_id,
-                "name": self.item_name(item_id),
+                "name": item_name,
                 "amount": 0,
                 "reason": reason,
                 "paths": [],
+                "source_url": metadata.get("source_url", ""),
+                "review_status": metadata.get("review_status", "not_imported"),
+                "source_type": metadata.get("source_type", "unknown"),
+                "source_step_summary": metadata.get(
+                    "source_step_summary",
+                    metadata.get("source_summary", ""),
+                ),
+                "source_summary": metadata.get(
+                    "source_summary",
+                    metadata.get("source_step_summary", ""),
+                ),
+                "source_parse_status": metadata.get("source_parse_status", ""),
+                "source_parse_reason": metadata.get("source_parse_reason", ""),
+                "parsed_recipe_ingredients": list(
+                    metadata.get("parsed_recipe_ingredients", [])
+                ),
+                "parsed_recipe_count": int(metadata.get("parsed_recipe_count", 0)),
+                "acquisition_option_count": int(
+                    metadata.get("acquisition_option_count", 0)
+                ),
+                "wiki_page_found": bool(metadata.get("wiki_page_found", False)),
+                "raw_wiki_page_title": metadata.get("raw_wiki_page_title", ""),
             },
         )
         entry["amount"] += amount
+
+        for field_name in (
+            "source_url",
+            "review_status",
+            "source_type",
+            "source_step_summary",
+            "source_summary",
+            "source_parse_status",
+            "source_parse_reason",
+            "wiki_page_found",
+            "raw_wiki_page_title",
+        ):
+            if not entry.get(field_name) and metadata.get(field_name):
+                entry[field_name] = metadata[field_name]
+
+        if not entry.get("parsed_recipe_ingredients") and metadata.get(
+            "parsed_recipe_ingredients"
+        ):
+            entry["parsed_recipe_ingredients"] = list(
+                metadata["parsed_recipe_ingredients"]
+            )
+
+        entry["parsed_recipe_count"] = max(
+            int(entry.get("parsed_recipe_count", 0)),
+            int(metadata.get("parsed_recipe_count", 0)),
+        )
+
+        entry["acquisition_option_count"] = max(
+            int(entry.get("acquisition_option_count", 0)),
+            int(metadata.get("acquisition_option_count", 0)),
+        )
 
         if path_text and path_text not in entry["paths"]:
             entry["paths"].append(path_text)
@@ -1308,6 +1585,13 @@ class RecipeEngine:
                 "The official API lists this item as account-bound or soulbound "
                 "and no recipe was found. Track this requirement manually."
             )
+            if depth > 0:
+                self.add_raw_material(
+                    item_id,
+                    amount,
+                    "Account-bound item with no safe recipe expansion; count current "
+                    "account storage toward this requirement.",
+                )
             self.add_manual_step(item_id, amount, reason, item_path)
             self.add_warning(f"{item_name}: {reason}")
             self.record_resolution(item_id, "account_bound_manual_stop", reason)
@@ -1381,6 +1665,21 @@ class RecipeEngine:
             return
 
         if override_decision["status"] == "manual_stop":
+            wiki_summary = self.wiki_recipe_summary_for_item(item_id, item_name)
+            override_verified = bool((override or {}).get("verified", False))
+
+            if not override_verified and wiki_summary.get("selected_recipe") is not None:
+                self.apply_source_step_recipe(
+                    item_id,
+                    amount,
+                    wiki_summary,
+                    current_path,
+                    active_item_ids,
+                    depth,
+                    max_depth,
+                )
+                return
+
             self.record_resolution(
                 item_id,
                 "override_manual_stop",
@@ -1405,6 +1704,19 @@ class RecipeEngine:
 
         if item and item_has_account_bound_flags(item):
             wiki_summary = self.wiki_recipe_summary_for_item(item_id, item_name)
+
+            if wiki_summary.get("selected_recipe") is not None:
+                self.apply_source_step_recipe(
+                    item_id,
+                    amount,
+                    wiki_summary,
+                    current_path,
+                    active_item_ids,
+                    depth,
+                    max_depth,
+                )
+                return
+
             reason = (
                 "The official API lists this item as account-bound or soulbound, so "
                 "automatic material expansion stops here."
@@ -1436,6 +1748,13 @@ class RecipeEngine:
                     "be shown as a useful manual source step."
                 )
 
+            if depth > 0:
+                self.add_raw_material(
+                    item_id,
+                    amount,
+                    "Account-bound item with no safe recipe expansion; count current "
+                    "account storage toward this requirement.",
+                )
             self.add_manual_step(item_id, amount, reason, current_path)
             self.record_resolution(
                 item_id,
@@ -1611,10 +1930,12 @@ class RecipeEngine:
         self.raw_materials = {}
         self.craftable_ingredients = {}
         self.manual_steps = {}
+        self.expanded_source_steps = {}
         self.recipes_used = {}
         self.resolution_log = {}
         self.wiki_sources_used = {}
         self.warnings = []
+        self.debug_events = []
 
         normalized_final_item_id = int(final_item_id)
         normalized_amount = int(amount)
@@ -1646,6 +1967,10 @@ class RecipeEngine:
                 self.manual_steps.values(),
                 key=lambda entry: (entry["name"], entry["item_id"], entry["reason"]),
             ),
+            "expanded_source_steps": sorted(
+                self.expanded_source_steps.values(),
+                key=lambda entry: (entry["name"], entry["item_id"]),
+            ),
             "recipes_used": sorted(
                 self.recipes_used.values(),
                 key=lambda entry: (entry["output_item_name"], entry["recipe_id"]),
@@ -1660,6 +1985,7 @@ class RecipeEngine:
                 key=lambda entry: (entry["name"], entry["item_id"]),
             ),
             "warnings": list(self.warnings),
+            "debug_events": list(self.debug_events),
         }
 
     def debug_recipe_source(
